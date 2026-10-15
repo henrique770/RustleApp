@@ -1,0 +1,4 @@
+server/.venv/
+server/__pycache__/
+client-macos/.build/
+build/

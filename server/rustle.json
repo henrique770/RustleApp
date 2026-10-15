@@ -1,0 +1,9 @@
+{
+  "dictionary": ["RustleApp", "Wispr", "Claude", "SwiftUI"],
+  "replacements": {
+    "rustle app": "RustleApp"
+  },
+  "snippets": {
+    "my email signature": "Best,\n<your name>"
+  }
+}
