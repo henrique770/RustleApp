@@ -25,6 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let meetingDetector = MeetingDetector()
     private var meetingClock: Timer?
     private var notetakerMenuItem: NSMenuItem?
+    private lazy var scratchpad = ScratchpadWindowController(model: model, client: TransformClient(baseURL: Config.serverURL))
+    private var scratchpadShortcut: GlobalShortcut?
+    /// True when the dictation started while the Scratchpad had the keyboard: the text goes into it.
+    private var dictatingIntoScratchpad = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("RustleApp started (hotkey=\(Config.trigger.rawValue), server=\(Config.serverURL), bundle=\(Bundle.main.bundlePath))")
@@ -64,6 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.overlay.dismissMeetingPrompt()
         }
         meetingDetector.start()
+
+        scratchpadShortcut = GlobalShortcut { [weak self] in self?.scratchpad.toggle() }
+        scratchpad.controller.onSend = { [weak self] text, app in self?.send(text, to: app) }
 
         showMainWindow()
         Task { await startServer() }
@@ -151,6 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setIcon("waveform", tip: "RustleApp")
         let menu = NSMenu()
         menu.addItem(item("Abrir RustleApp", #selector(showMainWindow)))
+        menu.addItem(item("Abrir Scratchpad (\(GlobalShortcut.label))", #selector(openScratchpadFromMenu)))
         let notetakerItem = item("Iniciar Notetaker", #selector(toggleNotetakerFromMenu))
         menu.addItem(notetakerItem)
         notetakerMenuItem = notetakerItem
@@ -184,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.stopMeeting = { [weak self] in self?.stopMeeting() }
         model.generateNotes = { [weak self] id in self?.generateNotes(for: id) }
         model.askMeeting = { [weak self] id, question in self?.ask(question, about: id) }
+        model.openScratchpad = { [weak self] id in self?.scratchpad.show(note: id) }
     }
 
     private func openMeeting(_ id: UUID) {
@@ -303,7 +312,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startDictation(handsFree: Bool) {
         guard !isRecording else { return }
         // Capture context before anything changes focus (Wispr does this via its AX helper).
-        capturedContext = FocusContext.capture()
+        dictatingIntoScratchpad = scratchpad.isKey
+        capturedContext = dictatingIntoScratchpad ? nil : FocusContext.capture()
         do {
             try recorder.start()
             isRecording = true
@@ -332,6 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setIcon("ellipsis.circle", tip: "Transcrevendo…")
         overlay.show(.transcribing)
         let context = capturedContext
+        let intoScratchpad = dictatingIntoScratchpad
 
         Task {
             defer { setIcon("waveform", tip: "RustleApp") }
@@ -349,22 +360,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     overlay.show(.message("Nada foi reconhecido", isError: true), autoHideAfter: 2.5)
                     return
                 }
-                let outcome = await inserter.insert(result.text)
                 var pasted = false
-                switch outcome {
-                case .pasted:
+                if intoScratchpad && scratchpad.isVisible {
+                    scratchpad.insertDictation(result.text.trimmingCharacters(in: .whitespaces))
                     pasted = true
                     overlay.show(.hidden)
-                case .copiedOnly(let reason):
-                    overlay.show(.message("\(reason). Cole com ⌘V", isError: true), autoHideAfter: 6)
+                } else {
+                    switch await inserter.insert(result.text) {
+                    case .pasted:
+                        pasted = true
+                        overlay.show(.hidden)
+                    case .copiedOnly(let reason):
+                        // Like Wispr ("paste_failure"): the text opens in the Scratchpad instead of being lost.
+                        Log.info("paste failed (\(reason)); opening the Scratchpad")
+                        overlay.show(.message("\(reason). Abrimos o texto no Scratchpad", isError: true), autoHideAfter: 4)
+                        scratchpad.show(text: result.text.trimmingCharacters(in: .whitespaces))
+                    }
                 }
                 model.record(.init(text: result.text.trimmingCharacters(in: .whitespaces), raw: result.raw,
-                                   appName: context?.appName, latencyMs: result.latencyMs, pasted: pasted,
-                                   durationSeconds: seconds))
+                                   appName: intoScratchpad ? "Scratchpad" : context?.appName, latencyMs: result.latencyMs,
+                                   pasted: pasted, durationSeconds: seconds))
             } catch {
                 Log.info("dictation failed: \(error.localizedDescription)")
                 model.serverState = .offline("Sem resposta do servidor")
                 overlay.show(.message("Erro: \(error.localizedDescription)", isError: true), autoHideAfter: 6)
+            }
+        }
+    }
+
+    // MARK: - Scratchpad
+
+    @objc private func openScratchpadFromMenu() { scratchpad.show() }
+
+    /// "Enviar no <app>": hide the Scratchpad, bring the app back and paste the note there.
+    private func send(_ text: String, to app: NSRunningApplication) {
+        scratchpad.hide()
+        app.activate()
+        Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            if case .copiedOnly(let reason) = await inserter.insert(text) {
+                overlay.show(.message("\(reason). Cole com ⌘V", isError: true), autoHideAfter: 5)
             }
         }
     }

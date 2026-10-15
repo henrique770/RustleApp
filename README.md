@@ -110,3 +110,25 @@ Rebuilt from Wispr Flow's Notetaker (evidence from REA: `MacCatapSystemAudioLoop
   Anthropic (Configurações) usa Claude; sem chave, resumo extrativo local.
 - **Chat**: `POST /v1/notes/ask` ("O que eu perdi?", e-mail de follow-up…).
 - Dados em `~/Library/Application Support/RustleApp/meetings.json`.
+
+## Scratchpad
+
+Rebuilt from Wispr Flow's Scratchpad (evidence from REA: the `scratchpad` BrowserWindow config —
+transparent panel 500×420, min 300×200, expanded 920×660, opened at the cursor and clamped to the work
+area, visible on all Spaces —, the `hub_scratchpad_*` strings, the renderer CSS modules and
+`POST /api/v1/transform/suggestions {content, count: 6}`).
+
+- **Abrir**: atalho global **⌃⌥N** (de novo para fechar), menu da barra de status, ou a página Notas.
+  Painel não-ativador: recebe o teclado sem tirar o app em uso da frente.
+- **Abas e notas**: ⌘T nova aba, ⌘W fecha, ⌃Tab / ⌘⇧] alterna, duplo clique renomeia. Barra lateral
+  com busca, fixar e apagar. As notas são as mesmas da página Notas do hub (`notes.json`).
+- **Ditado**: com o Scratchpad em foco, segure fn e o texto entra no cursor. Se uma colagem falhar em
+  outro app, o texto ditado abre numa aba nova do Scratchpad (como o "paste_failure" do Wispr).
+- **Copiar / Enviar no app**: copia a nota, ou cola no app que estava em frente quando você abriu.
+- **Histórico de versões**: Criada, Ditado, Edições digitadas, Transformação; clique para restaurar.
+- **Formatação**: Markdown leve (negrito, itálico, código, link, título, listas, checklist, citação),
+  com Enter continuando listas.
+- **Transformações**: `POST /v1/transform/suggestions` e `POST /v1/transform`. Com chave da Anthropic,
+  o Claude sugere e aplica qualquer pedido; sem chave, há 6 transformações locais (corrigir, tópicos,
+  checklist, mais curto, parágrafo, título).
+- **Configuração**: "Ao abrir o Scratchpad" — retomar última nota, nova aba ou última nota fixada.

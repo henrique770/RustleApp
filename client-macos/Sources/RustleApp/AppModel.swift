@@ -21,15 +21,71 @@ final class AppModel: ObservableObject {
         var words: Int { text.split(whereSeparator: \.isWhitespace).count }
     }
 
+    /// A note, shared by the hub's Notes page and the Scratchpad window (as in Wispr Flow, where
+    /// scratchpad notes are the hub notes). Fields after `updated` were added for the Scratchpad;
+    /// they are optional on decode so notes saved by earlier versions still load.
     struct Note: Codable, Identifiable, Hashable {
         var id = UUID()
         var body: String = ""
         var updated = Date()
+        var created = Date()
+        /// Title set by renaming the tab; otherwise the first line is the title.
+        var customTitle: String?
+        var pinned = false
+        /// Version history, oldest first ("Created", "Dictated", "Typed edits", "Transform"...).
+        var versions: [NoteVersion] = []
+
+        init(body: String = "") {
+            self.body = body
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(UUID.self, forKey: .id)
+            body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
+            updated = try c.decodeIfPresent(Date.self, forKey: .updated) ?? Date()
+            created = try c.decodeIfPresent(Date.self, forKey: .created) ?? updated
+            customTitle = try c.decodeIfPresent(String.self, forKey: .customTitle)
+            pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
+            versions = try c.decodeIfPresent([NoteVersion].self, forKey: .versions) ?? []
+        }
+
         var title: String {
+            if let customTitle, !customTitle.trimmingCharacters(in: .whitespaces).isEmpty { return customTitle }
             let first = body.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
             let trimmed = first.trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: #"^(#+|-\s\[[ x]\]|[-*•>]|\d+\.)\s+"#, with: "", options: .regularExpression)
             return trimmed.isEmpty ? "Nota sem título" : String(trimmed.prefix(60))
         }
+        var isEmpty: Bool { body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    struct NoteVersion: Codable, Identifiable, Hashable {
+        enum Source: String, Codable {
+            case created, dictated, typed, transform, customTransform
+
+            var label: String {
+                switch self {
+                case .created: return "Criada"
+                case .dictated: return "Ditado"
+                case .typed: return "Edições digitadas"
+                case .transform: return "Transformação"
+                case .customTransform: return "Transformação personalizada"
+                }
+            }
+            var icon: String {
+                switch self {
+                case .created: return "plus.circle"
+                case .dictated: return "mic"
+                case .typed: return "keyboard"
+                case .transform, .customTransform: return "sparkles"
+                }
+            }
+        }
+        var id = UUID()
+        var date = Date()
+        var source: Source
+        var body: String
     }
 
     /// Mirrors server/formatter.py `Settings`; the server reloads this file when it changes.
@@ -106,6 +162,8 @@ final class AppModel: ObservableObject {
     var stopMeeting: () -> Void = {}
     var generateNotes: (UUID) -> Void = { _ in }
     var askMeeting: (UUID, String) -> Void = { _, _ in }
+    /// Opens the Scratchpad window, optionally on one note.
+    var openScratchpad: (UUID?) -> Void = { _ in }
 
     // MARK: Persistence
 
@@ -135,6 +193,31 @@ final class AppModel: ObservableObject {
         loading = false
         // Make sure the server has a settings file to read on first launch.
         if persist, !FileManager.default.fileExists(atPath: Self.settingsURL.path) { save(serverSettings, "settings.json") }
+    }
+
+    // MARK: Notes
+
+    func note(_ id: UUID) -> Note? { notes.first { $0.id == id } }
+
+    func updateNote(_ id: UUID, _ change: (inout Note) -> Void) {
+        guard let i = notes.firstIndex(where: { $0.id == id }) else { return }
+        change(&notes[i])
+    }
+
+    /// Records a version unless the text did not change. Consecutive typed edits collapse into one
+    /// version per 2 minutes, so typing does not flood the history.
+    func addVersion(_ id: UUID, source: NoteVersion.Source) {
+        updateNote(id) { n in
+            guard n.versions.last?.body != n.body else { return }
+            if source == .typed, let last = n.versions.last, last.source == .typed,
+               Date().timeIntervalSince(last.date) < 120 {
+                n.versions[n.versions.count - 1].body = n.body
+                n.versions[n.versions.count - 1].date = Date()
+            } else {
+                n.versions.append(NoteVersion(source: source, body: n.body))
+            }
+            if n.versions.count > 50 { n.versions.removeFirst(n.versions.count - 50) }
+        }
     }
 
     func record(_ entry: HistoryEntry) {
@@ -240,4 +323,6 @@ enum Prefs {
     static let hotkey = "hotkey"            // fn | right_option | right_command
     static let language = "language"        // pt | en | auto
     static let whisperModel = "whisperModel" // base | small | medium
+    static let scratchpadOpenBehavior = "scratchpadOpenBehavior" // resume | new_tab | last_pinned
+    static let scratchpadLastNote = "scratchpadLastNote"
 }

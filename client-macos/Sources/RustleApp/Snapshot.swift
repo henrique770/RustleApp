@@ -33,6 +33,40 @@ enum Snapshot {
             model.activeMeetingID = nil
         }
 
+        // Scratchpad: default, notes sidebar + transforms, formatting + version history, empty.
+        let sp = ScratchpadController(model: model, client: TransformClient(baseURL: URL(string: "http://127.0.0.1:1")!))
+        var note = AppModel.Note(body: "Ideias para o lançamento\n\n- [ ] Revisar a landing page com o time\n- [x] Gravar o vídeo de demo\n- [ ] Mandar o **rascunho do e-mail** para a Ana até sexta\n\n> Lembrar: o foco é velocidade, não features.")
+        note.pinned = true
+        note.versions = [.init(date: Date().addingTimeInterval(-3600), source: .created, body: "Ideias"),
+                         .init(date: Date().addingTimeInterval(-1800), source: .dictated, body: "Ideias para o lançamento"),
+                         .init(date: Date().addingTimeInterval(-300), source: .transform, body: note.body)]
+        model.notes = [note, AppModel.Note(body: "Mensagem pro Pedro\nOi Pedro, consegue revisar o contrato hoje?"),
+                       AppModel.Note(body: "Lista de compras\npão, café, frutas")] + model.notes
+        sp.open(note: note.id)
+        sp.newTab()
+        sp.activate(sp.tabs[0].id)
+        sp.targetApp = NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == "com.apple.finder" }
+        render(ScratchpadView(controller: sp, model: model), size: ScratchpadController.defaultSize,
+               to: dir.appendingPathComponent("scratchpad.png"))
+        sp.sidebarOpen = true
+        sp.bottomBar = .transforms
+        sp.suggestions = [.init(id: "fix", label: "Corrigir texto", prompt: ""), .init(id: "bullets", label: "Lista de tópicos", prompt: ""),
+                          .init(id: "shorter", label: "Mais curto", prompt: ""), .init(id: "email", label: "Transformar em e-mail", prompt: "")]
+        sp.toast = .init(message: "Copiado")
+        render(ScratchpadView(controller: sp, model: model), size: NSSize(width: 720, height: 560),
+               to: dir.appendingPathComponent("scratchpad-transforms.png"))
+        sp.sidebarOpen = false
+        sp.toast = nil
+        sp.bottomBar = .formatting
+        sp.versionMenuOpen = true
+        render(ScratchpadView(controller: sp, model: model), size: NSSize(width: 560, height: 480),
+               to: dir.appendingPathComponent("scratchpad-formatting.png"))
+        sp.versionMenuOpen = false
+        sp.bottomBar = .none
+        sp.activate(sp.tabs[1].id)
+        render(ScratchpadView(controller: sp, model: model), size: ScratchpadController.defaultSize,
+               to: dir.appendingPathComponent("scratchpad-empty.png"))
+
         let states: [(String, OverlayModel.Phase, Bool, Bool)] = [
             ("resting", .hidden, false, false),
             ("hover", .hidden, true, false),

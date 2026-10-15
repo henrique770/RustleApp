@@ -15,7 +15,7 @@ final class ServerManager {
         self.settingsPath = settingsPath
     }
 
-    static let requiredAPIVersion = 3
+    static let requiredAPIVersion = 5
 
     private func health() async -> [String: Any]? {
         var req = URLRequest(url: baseURL.appendingPathComponent("health"))

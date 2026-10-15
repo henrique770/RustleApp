@@ -30,7 +30,7 @@ struct MainView: View {
         var icon: String {
             switch self {
             case .home: return "square.grid.2x2"
-            case .notetaker: return "person.2.wave.2"
+            case .notetaker: return "record.circle"
             case .dictionary: return "book.closed"
             case .snippets: return "scissors"
             case .style: return "textformat"
@@ -790,7 +790,8 @@ private struct NotesPage: View {
     @State private var query = ""
 
     private var notes: [AppModel.Note] {
-        query.isEmpty ? model.notes : model.notes.filter { $0.body.localizedCaseInsensitiveContains(query) }
+        (query.isEmpty ? model.notes : model.notes.filter { $0.body.localizedCaseInsensitiveContains(query) })
+            .sorted { $0.pinned && !$1.pinned }
     }
 
     var body: some View {
@@ -799,6 +800,7 @@ private struct NotesPage: View {
                 HStack {
                     PageTitle(text: "Notas")
                     Spacer()
+                    IconButton(systemName: "macwindow.on.rectangle", help: "Abrir o Scratchpad (\(GlobalShortcut.label))") { model.openScratchpad(nil) }
                     IconButton(systemName: "square.and.pencil", help: "Nova nota") { newNote() }
                 }
                 HubTextField(placeholder: "Buscar nas suas notas", text: $query)
@@ -828,6 +830,10 @@ private struct NotesPage: View {
                             Text(model.notes[i].updated.formatted(date: .abbreviated, time: .shortened))
                                 .font(DS.ui(13)).foregroundColor(DS.foregroundTertiary)
                             Spacer()
+                            IconButton(systemName: model.notes[i].pinned ? "pin.fill" : "pin", help: model.notes[i].pinned ? "Desafixar" : "Fixar") {
+                                model.notes[i].pinned.toggle()
+                            }
+                            IconButton(systemName: "macwindow.on.rectangle", help: "Abrir no Scratchpad") { model.openScratchpad(model.notes[i].id) }
                             IconButton(systemName: "trash", help: "Apagar nota") { delete(model.notes[i].id) }
                         }
                         TextEditor(text: Binding(
@@ -836,16 +842,21 @@ private struct NotesPage: View {
                             .font(DS.ui(16))
                             .scrollContentBackground(.hidden)
                             .lineSpacing(4)
-                        Text("Clique no texto e segure fn para ditar direto na nota.")
+                        Text("Clique no texto e segure fn para ditar direto na nota. Para anotar sem sair do app em uso, abra o Scratchpad com \(GlobalShortcut.label).")
                             .font(DS.ui(13)).foregroundColor(DS.foregroundTertiary)
                     }
                     .padding(.horizontal, 40).padding(.vertical, 32)
                 } else {
                     VStack(spacing: 16) {
-                        PageTitle(text: "Um lugar para pensar em voz alta", size: 24)
-                        Text("Crie uma nota e dite suas ideias com o fn.").font(DS.ui(15)).foregroundColor(DS.neutral600)
-                        Button("Nova nota") { newNote() }.buttonStyle(PrimaryButtonStyle())
+                        PageTitle(text: "Para pensamentos rápidos que você quer retomar depois", size: 24)
+                        Text("Uma lista de tarefas, uma mensagem para revisar antes de enviar, uma ideia solta.\nO Scratchpad é o seu espaço para salvar, criar e explorar.")
+                            .font(DS.ui(15)).foregroundColor(DS.neutral600).multilineTextAlignment(.center)
+                        HStack(spacing: 8) {
+                            Button("Abrir Scratchpad") { model.openScratchpad(nil) }.buttonStyle(PrimaryButtonStyle())
+                            Button("Nova nota aqui") { newNote() }.buttonStyle(SecondaryButtonStyle())
+                        }
                     }
+                    .padding(.horizontal, 40)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
@@ -875,7 +886,10 @@ private struct NoteRow: View {
     var body: some View {
         Button(action: select) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(note.title).font(DS.ui(15, DS.w550)).lineLimit(1)
+                HStack(spacing: 4) {
+                    if note.pinned { Image(systemName: "pin.fill").font(.system(size: 9)).foregroundColor(DS.foregroundTertiary) }
+                    Text(note.title).font(DS.ui(15, DS.w550)).lineLimit(1)
+                }
                 Text(preview).font(DS.ui(13)).foregroundColor(DS.foregroundTertiary).lineLimit(2)
             }
             .padding(10)
@@ -901,6 +915,7 @@ private struct SettingsPage: View {
     @AppStorage(Prefs.hotkey) private var hotkey = "fn"
     @AppStorage(Prefs.language) private var language = "pt"
     @AppStorage(Prefs.whisperModel) private var whisperModel = "small"
+    @AppStorage(Prefs.scratchpadOpenBehavior) private var scratchpadOpen = "resume"
     @State private var apiKey = Keychain.readAPIKey() ?? ""
     @State private var keySaved = false
 
@@ -929,6 +944,27 @@ private struct SettingsPage: View {
                                 Text("Português").tag("pt")
                                 Text("Inglês").tag("en")
                                 Text("Automático").tag("auto")
+                            }.labelsHidden()
+                        }
+                    }
+                }
+
+                SettingsSection(title: "Scratchpad") {
+                    SettingsCard {
+                        SettingsRow(label: "Abrir o Scratchpad", description: "Atalho global; também no menu da barra de status. Se uma colagem falhar, o texto ditado abre no Scratchpad.") {
+                            HStack(spacing: 8) {
+                                Text(GlobalShortcut.label).font(DS.ui(14, .semibold))
+                                    .padding(.horizontal, 8).padding(.vertical, 3)
+                                    .background(RoundedRectangle(cornerRadius: 6).fill(DS.card))
+                                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(DS.border, lineWidth: 1))
+                                Button("Abrir") { model.openScratchpad(nil) }.buttonStyle(SecondaryButtonStyle())
+                            }
+                        }
+                        SettingsRow(label: "Ao abrir o Scratchpad", description: "Escolha o que acontece quando você abre o Scratchpad.") {
+                            Picker("", selection: $scratchpadOpen) {
+                                Text("Retomar última nota").tag("resume")
+                                Text("Abrir em nova aba").tag("new_tab")
+                                Text("Última nota fixada").tag("last_pinned")
                             }.labelsHidden()
                         }
                     }

@@ -7,6 +7,8 @@ but runs on your machine with an open-source Whisper model.
     POST /v1/transcribe  {"audio_wav_b64": "...", "language"}        ->  {"segments": [{"start", "end", "text"}]}
     POST /v1/notes       {"transcript": [...], "user_notes", ...}     ->  {"title", "summary", "action_items", "engine"}
     POST /v1/notes/ask   {"question", "transcript", ...}              ->  {"answer", "engine"}
+    POST /v1/transform/suggestions {"content", "count"}               ->  {"suggestions": [{"id", "label", "prompt"}]}
+    POST /v1/transform   {"content", "prompt", "suggestion_id", ...}  ->  {"text", "engine"}
     GET  /health
 """
 
@@ -26,6 +28,7 @@ from pydantic import BaseModel
 
 from formatter import Formatter, SettingsStore
 from notes import NotesWriter
+from transforms import Transformer
 
 log = logging.getLogger("rustle")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -37,7 +40,7 @@ WHISPER_COMPUTE = os.environ.get("RUSTLE_WHISPER_COMPUTE", "int8")
 WHISPER_LANGUAGE = os.environ.get("RUSTLE_LANGUAGE") or None
 MAX_AUDIO_SECONDS = 600
 # Bumped when the app/server contract changes; the desktop app restarts older servers.
-API_VERSION = 4
+API_VERSION = 5
 
 
 class Context(BaseModel):
@@ -109,6 +112,18 @@ class AskRequest(BaseModel):
     summary: list[SummarySection] = []
 
 
+class SuggestionsRequest(BaseModel):
+    content: str = ""
+    count: int = 6
+
+
+class TransformRequest(BaseModel):
+    content: str
+    prompt: str
+    suggestion_id: Optional[str] = None
+    selection: Optional[str] = None
+
+
 class Transcriber:
     def __init__(self) -> None:
         from faster_whisper import WhisperModel
@@ -159,6 +174,7 @@ def decode_wav(data: bytes) -> np.ndarray:
 app = FastAPI(title="rustle-server")
 formatter = Formatter(SettingsStore())
 notes_writer = NotesWriter()
+transformer = Transformer(notes_writer)
 transcriber: Optional[Transcriber] = None
 
 
@@ -230,6 +246,20 @@ def notes(req: NotesRequest) -> dict:
 def ask(req: AskRequest) -> dict:
     return notes_writer.ask(req.question, [t.model_dump() for t in req.transcript], req.user_notes,
                             [s.model_dump() for s in req.summary])
+
+
+@app.post("/v1/transform/suggestions")
+def transform_suggestions(req: SuggestionsRequest) -> dict:
+    return transformer.suggestions(req.content, req.count)
+
+
+@app.post("/v1/transform")
+def transform(req: TransformRequest) -> dict:
+    started = time.perf_counter()
+    result = transformer.apply(req.content, req.prompt, req.suggestion_id, req.selection)
+    log.info("transform %s via %s in %dms", req.suggestion_id or "custom", result.get("engine"),
+             int((time.perf_counter() - started) * 1000))
+    return result
 
 
 @app.post("/v1/shutdown")
