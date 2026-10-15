@@ -31,13 +31,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>ATSApplicationFontsPath</key><string>Fonts</string>
   <key>NSMicrophoneUsageDescription</key><string>O RustleApp grava sua voz para ditado e para o Notetaker.</string>
   <key>NSAudioCaptureUsageDescription</key><string>O Notetaker grava o áudio das chamadas (os outros participantes) para transcrever a reunião.</string>
 </dict>
 </plist>
 PLIST
+
+# The app starts rustle-server from this checkout, so it keeps working when copied to /Applications.
+/usr/libexec/PlistBuddy -c "Add :RustleServerScript string $ROOT/scripts/run-server.sh" "$APP/Contents/Info.plist"
 
 xattr -cr "$APP"
 IDENTITY="$(security find-identity -p codesigning 2>/dev/null | awk '/"RustleApp Local Signing"/ {print $2; exit}')"

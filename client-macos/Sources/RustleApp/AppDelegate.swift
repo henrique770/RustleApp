@@ -46,7 +46,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if self.isRecording { self.stopDictation() } else { self.startDictation(handsFree: true) }
         }
 
-        requestPermissions()
+        // On first run the questionnaire asks for each permission at its own step; a microphone
+        // grant that already exists is still read now (no prompt is shown for a decided status).
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        Log.info("microphone status at launch: \(micStatus.rawValue)")
+        if UserDefaults.standard.bool(forKey: Prefs.onboardingDone) {
+            requestPermissions()
+        } else if micStatus != .notDetermined {
+            AVCaptureDevice.requestAccess(for: .audio) { granted in Log.info("microphone access: \(granted)") }
+        }
         refreshPermissions()
         startHotkey()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in

@@ -115,6 +115,11 @@ final class ServerManager {
         if let custom = UserDefaults.standard.string(forKey: "serverScript") {
             return URL(fileURLWithPath: custom)
         }
+        // Written by build-app.sh: the checkout the app was built from (works from /Applications too).
+        if let built = Bundle.main.object(forInfoDictionaryKey: "RustleServerScript") as? String,
+           FileManager.default.isExecutableFile(atPath: built) {
+            return URL(fileURLWithPath: built)
+        }
         // build/RustleApp.app -> ../../scripts/run-server.sh
         return Bundle.main.bundleURL
             .deletingLastPathComponent().deletingLastPathComponent()

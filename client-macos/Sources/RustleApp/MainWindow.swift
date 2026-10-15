@@ -7,6 +7,7 @@ import SwiftUI
 struct MainView: View {
     @ObservedObject var model: AppModel
     @State private var page: Page
+    @AppStorage(Prefs.onboardingDone) private var onboardingDone = false
 
     init(model: AppModel, initialPage: Page = .home) {
         self.model = model
@@ -41,6 +42,20 @@ struct MainView: View {
     }
 
     var body: some View {
+        if onboardingDone {
+            hub
+        } else {
+            // First run: the questionnaire fills the window (Wispr shows its onboarding the same way).
+            OnboardingView(model: model) {
+                onboardingDone = true
+                page = .home
+            }
+            .frame(minWidth: 900, minHeight: 600)
+            .ignoresSafeArea()
+        }
+    }
+
+    private var hub: some View {
         HStack(spacing: 0) {
             Sidebar(model: model, page: $page)
             VStack(spacing: 0) {
@@ -235,7 +250,7 @@ private struct HomePage: View {
         PageScroll {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(alignment: .firstTextBaseline) {
-                    PageTitle(text: "Bem-vindo de volta, \(model.firstName)", size: 34)
+                    PageTitle(text: model.displayFirstName.isEmpty ? "Bem-vindo de volta" : "Bem-vindo de volta, \(model.displayFirstName)", size: 34)
                     Spacer()
                     StatusChip(state: model.serverState)
                 }
@@ -928,6 +943,21 @@ private struct SettingsPage: View {
                         .font(DS.ui(15)).foregroundColor(DS.neutral600)
                 }
 
+                SettingsSection(title: "Perfil") {
+                    SettingsCard {
+                        SettingsRow(label: "Nome", description: "Aparece na tela de início (“Bem-vindo de volta, …”).") {
+                            ProfileField(placeholder: "Nome", text: $model.firstName)
+                        }
+                        SettingsRow(label: "Sobrenome", description: "Opcional.") {
+                            ProfileField(placeholder: "Sobrenome", text: $model.lastName)
+                        }
+                        SettingsRow(label: "Questionário inicial", description: "Refaça as perguntas da primeira abertura: nome, idioma, atalho, estilo e permissões.") {
+                            Button("Refazer") { UserDefaults.standard.set(false, forKey: Prefs.onboardingDone) }
+                                .buttonStyle(SecondaryButtonStyle())
+                        }
+                    }
+                }
+
                 SettingsSection(title: "Geral") {
                     SettingsCard {
                         SettingsRow(label: "Atalho de ditado", description: "Segure para ditar e solte para colar. Com fn, defina em Ajustes → Teclado “Pressionar a tecla 🌐 para: Não Fazer Nada”.") {
@@ -1037,6 +1067,18 @@ private struct SettingsPage: View {
         case .starting: return "Iniciando e carregando o modelo…"
         case .offline(let msg): return msg
         }
+    }
+}
+
+private struct ProfileField: View {
+    let placeholder: String
+    @Binding var text: String
+    var body: some View {
+        TextField("", text: $text, prompt: Text(placeholder).foregroundColor(DS.vast500))
+            .textFieldStyle(.plain).font(DS.ui(15))
+            .padding(.horizontal, 10).frame(height: 32)
+            .background(RoundedRectangle(cornerRadius: 8).fill(DS.card))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(DS.border, lineWidth: 1))
     }
 }
 

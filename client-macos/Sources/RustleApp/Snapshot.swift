@@ -33,6 +33,12 @@ enum Snapshot {
             model.activeMeetingID = nil
         }
 
+        // Onboarding questionnaire, every step.
+        for step in OnboardingView.Step.allCases {
+            render(OnboardingView(model: model, initialStep: step) {}, size: NSSize(width: 1100, height: 720),
+                   to: dir.appendingPathComponent("onboarding-\(step.rawValue)-\(step).png"))
+        }
+
         // Scratchpad: default, notes sidebar + transforms, formatting + version history, empty.
         let sp = ScratchpadController(model: model, client: TransformClient(baseURL: URL(string: "http://127.0.0.1:1")!))
         var note = AppModel.Note(body: "Ideias para o lançamento\n\n- [ ] Revisar a landing page com o time\n- [x] Gravar o vídeo de demo\n- [ ] Mandar o **rascunho do e-mail** para a Ana até sexta\n\n> Lembrar: o foco é velocidade, não features.")

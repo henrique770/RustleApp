@@ -111,8 +111,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// First name for the "Bem-vindo de volta" greeting.
-    let firstName: String = (NSFullUserName().split(separator: " ").first.map(String.init) ?? NSUserName()).capitalized
+    // MARK: Profile (asked in the onboarding questionnaire, editable in Settings → Perfil)
+
+    /// Shown in "Bem-vindo de volta, <nome>". Wispr takes it from the account it signs you up
+    /// with; RustleApp has no account, so the first onboarding question asks for it.
+    @Published var firstName: String = UserDefaults.standard.string(forKey: Prefs.firstName) ?? "" {
+        didSet { if persist { UserDefaults.standard.set(firstName.trimmingCharacters(in: .whitespaces), forKey: Prefs.firstName) } }
+    }
+    @Published var lastName: String = UserDefaults.standard.string(forKey: Prefs.lastName) ?? "" {
+        didSet { if persist { UserDefaults.standard.set(lastName.trimmingCharacters(in: .whitespaces), forKey: Prefs.lastName) } }
+    }
+    /// The macOS account's first name, offered as the default answer.
+    static let systemFirstName: String = (NSFullUserName().split(separator: " ").first.map(String.init) ?? NSUserName()).capitalized
+    static let systemLastName: String = NSFullUserName().split(separator: " ").dropFirst().joined(separator: " ")
+    var displayFirstName: String { firstName.trimmingCharacters(in: .whitespaces) }
 
     @Published var history: [HistoryEntry] = [] { didSet { save(history, "history.json") } }
     @Published var notes: [Note] = [] { didSet { save(notes, "notes.json") } }
@@ -325,4 +337,9 @@ enum Prefs {
     static let whisperModel = "whisperModel" // base | small | medium
     static let scratchpadOpenBehavior = "scratchpadOpenBehavior" // resume | new_tab | last_pinned
     static let scratchpadLastNote = "scratchpadLastNote"
+    static let onboardingDone = "onboardingDone"
+    static let firstName = "profileFirstName"
+    static let lastName = "profileLastName"
+    static let role = "profileRole"
+    static let typingPlaces = "profileTypingPlaces"
 }

@@ -22,6 +22,75 @@ RustleApp.app (Swift, menu bar)                rustle-server (Python, localhost:
 | dictionary / replacements / snippets, hub window | `MainWindow.swift` + `~/Library/Application Support/RustleApp/settings.json` |
 | `PasteText` → clipboard, Cmd+V, restore after 500 ms, ConcealedType | `TextInserter.swift` |
 
+## Instalação
+
+### Requisitos
+
+- Mac com **macOS 14 (Sonoma) ou mais recente**. Apple Silicon é recomendado; Intel funciona, mas transcreve mais devagar.
+- **Ferramentas de linha de comando da Apple** (Swift): `xcode-select --install`.
+- **Python 3.10+**. Se não tiver, instale pelo [Homebrew](https://brew.sh): `brew install python@3.12`.
+- Cerca de **2 GB livres**: dependências do servidor e o modelo Whisper, baixado no primeiro uso.
+- Internet só na instalação e no primeiro ditado, para baixar o modelo. Depois disso, a transcrição roda offline.
+
+### Instalar
+
+```bash
+git clone <url-deste-repositório> RustleApp   # ou baixe e descompacte o .zip
+cd RustleApp
+./scripts/install.sh
+```
+
+O `install.sh` faz, nesta ordem:
+
+1. Confere os requisitos.
+2. Cria o ambiente Python do servidor (`server/.venv`).
+3. Cria um certificado local de assinatura, para o macOS lembrar das permissões entre atualizações.
+4. Compila o app e o copia para `/Applications`. Se essa pasta não aceitar escrita, usa `~/Applications`.
+5. Abre o app.
+
+> Não mova nem apague a pasta do repositório depois de instalar: o app inicia o servidor de
+> transcrição a partir dela. Se mudar a pasta de lugar, rode `./scripts/install.sh` de novo.
+
+### Primeira abertura
+
+Na primeira abertura, o RustleApp mostra um questionário curto, como o onboarding do Wispr Flow:
+
+| Etapa | Pergunta |
+|---|---|
+| Começar | **Seu nome** (aparece em “Bem-vindo de volta, …” na tela de início), o que você faz e onde mais digita |
+| Preferências | idioma em que você fala, atalho de ditado (fn, Option direito ou Command direito) e tom da escrita por tipo de app |
+| Permissões | **Microfone** e **Acessibilidade**, com um botão que leva direto ao Ajuste do Sistema |
+| Pronto | como ditar e como abrir o Scratchpad |
+
+Tudo isso pode ser mudado depois em **Configurações**. Em **Perfil** ficam o nome, o sobrenome e
+o botão *Refazer* do questionário.
+
+Se escolher a tecla **fn**, vá em Ajustes do Sistema → Teclado e defina *“Pressionar a tecla 🌐 para:
+Não Fazer Nada”*. Para o Notetaker gravar o som das chamadas, o macOS pede **Gravação de áudio do
+sistema** na primeira reunião.
+
+### Atualizar
+
+```bash
+cd RustleApp
+git pull
+./scripts/install.sh
+```
+
+Suas notas, histórico e configurações ficam em `~/Library/Application Support/RustleApp/` e são mantidos.
+
+### Desinstalar
+
+```bash
+rm -rf /Applications/RustleApp.app ~/Applications/RustleApp.app
+rm -rf ~/Library/Application\ Support/RustleApp ~/Library/Logs/RustleApp*.log
+defaults delete dev.rustleapp.client
+security delete-identity -c "RustleApp Local Signing"
+tccutil reset All dev.rustleapp.client
+```
+
+O último comando remove as permissões que o app recebeu. Depois disso, apague a pasta do repositório.
+
 ## Services it needs
 
 1. **rustle-server** (required, local). FastAPI + [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
@@ -35,7 +104,9 @@ RustleApp.app (Swift, menu bar)                rustle-server (Python, localhost:
 
 No account, auth server, or telemetry is involved.
 
-## Run
+## Run (desenvolvimento)
+
+Para quem vai mexer no código. Para só usar o app, veja [Instalação](#instalação).
 
 ```bash
 ./scripts/create-signing-cert.sh   # once: local signing identity, so permissions survive rebuilds
