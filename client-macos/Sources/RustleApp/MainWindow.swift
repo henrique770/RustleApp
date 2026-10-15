@@ -14,11 +14,12 @@ struct MainView: View {
     }
 
     enum Page: String, CaseIterable, Identifiable {
-        case home, dictionary, snippets, style, notes, settings
+        case home, notetaker, dictionary, snippets, style, notes, settings
         var id: String { rawValue }
         var title: String {
             switch self {
             case .home: return "Início"
+            case .notetaker: return "Notetaker"
             case .dictionary: return "Dicionário"
             case .snippets: return "Snippets"
             case .style: return "Estilo"
@@ -29,6 +30,7 @@ struct MainView: View {
         var icon: String {
             switch self {
             case .home: return "square.grid.2x2"
+            case .notetaker: return "person.2.wave.2"
             case .dictionary: return "book.closed"
             case .snippets: return "scissors"
             case .style: return "textformat"
@@ -46,6 +48,7 @@ struct MainView: View {
                 PageCard {
                     switch page {
                     case .home: HomePage(model: model, page: $page)
+                    case .notetaker: NotetakerPage(model: model)
                     case .dictionary: DictionaryPage(model: model)
                     case .snippets: SnippetsPage(model: model)
                     case .style: StylePage(model: model)
@@ -62,6 +65,11 @@ struct MainView: View {
         .font(DS.ui(15))
         .frame(minWidth: 900, minHeight: 600)
         .ignoresSafeArea()
+        .onChange(of: model.pageRequest) { request in
+            guard let request else { return }
+            page = request
+            model.pageRequest = nil
+        }
     }
 }
 
@@ -110,8 +118,13 @@ private struct Sidebar: View {
             BrandRow()
                 .padding(.bottom, 16)
             VStack(spacing: 4) {
-                ForEach([MainView.Page.home, .dictionary, .snippets, .style, .notes]) { p in
-                    SidebarItem(title: p.title, icon: p.icon, active: page == p) { page = p }
+                ForEach([MainView.Page.home, .notetaker, .dictionary, .snippets, .style, .notes]) { p in
+                    SidebarItem(title: p.title, icon: p.icon, active: page == p,
+                                recording: p == .notetaker && model.activeMeetingID != nil) {
+                        // Clicking Notetaker again returns to the meeting list.
+                        if p == .notetaker && page == .notetaker { model.openMeetingID = nil }
+                        page = p
+                    }
                 }
             }
             Spacer(minLength: 0)
@@ -161,6 +174,7 @@ private struct SidebarItem: View {
     let title: String
     let icon: String
     let active: Bool
+    var recording = false
     let action: () -> Void
     @State private var hover = false
 
@@ -172,6 +186,7 @@ private struct SidebarItem: View {
                     .frame(width: 20, height: 20)
                 Text(title).font(DS.ui(15, DS.w550))
                 Spacer(minLength: 0)
+                if recording { RecordingDot() }
             }
             .padding(8)
             .background(RoundedRectangle(cornerRadius: 6).fill(active || hover ? DS.neutral200 : DS.backgroundTertiary))
@@ -961,6 +976,7 @@ private struct SettingsPage: View {
                     SettingsCard {
                         PermissionRow(label: "Acessibilidade", description: "Detecta o fn em qualquer app e cola o texto.", ok: model.permissions.accessibility, pane: "Privacy_Accessibility")
                         PermissionRow(label: "Microfone", description: "Grava sua voz enquanto você segura o atalho.", ok: model.permissions.microphone, pane: "Privacy_Microphone")
+                        PermissionRow(label: "Gravação de áudio do sistema", description: model.systemAudioError.map { "Notetaker: \($0)." } ?? "Notetaker: grava o som da chamada (os outros participantes). O macOS pede na primeira gravação.", ok: model.systemAudioError == nil, pane: "Privacy_AudioCapture", optional: true)
                         PermissionRow(label: "Monitoramento de Entrada", description: "Opcional: detecção extra do atalho.", ok: model.permissions.inputMonitoring, pane: "Privacy_ListenEvent", optional: true)
                         HStack(spacing: 8) {
                             Button("Reparar permissões") { model.repairPermissions() }.buttonStyle(SecondaryButtonStyle())

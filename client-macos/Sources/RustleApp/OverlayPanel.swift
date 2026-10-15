@@ -22,6 +22,10 @@ final class OverlayModel: ObservableObject {
     @Published var phase: Phase = .hidden
     @Published var hovering = false
     @Published var handsFree = false
+    /// Notetaker is recording a meeting: the resting pill shows a red dot (dictation still works).
+    @Published var meetingRecording = false
+    /// "Reunião detectada" reminder (Wispr: hub_calendar_reminder_title_autodetect); a click starts Notetaker.
+    @Published var meetingPrompt: String?
     @Published var levels: [CGFloat] = Array(repeating: 0, count: 11)
 
     func push(level: Float) {
@@ -40,6 +44,9 @@ final class OverlayPanel {
     let model = OverlayModel()
     /// Called when the user clicks the bar (start / stop hands-free dictation).
     var onClick: () -> Void = {}
+    /// Called when the user clicks the bar while a "meeting detected" prompt is showing.
+    var onMeetingPromptClick: () -> Void = {}
+    private var promptWork: DispatchWorkItem?
 
     private let panel: NSPanel
     private var hideWork: DispatchWorkItem?
@@ -48,7 +55,7 @@ final class OverlayPanel {
     private static let size = NSSize(width: 420, height: 110)
     /// Hot zone around the pill (in panel coordinates, origin bottom-left).
     private var hotRect: NSRect {
-        let w: CGFloat = model.phase == .hidden && !model.hovering ? 90 : 140
+        let w: CGFloat = model.phase == .hidden && !model.hovering && model.meetingPrompt == nil ? 90 : 140
         return NSRect(x: (Self.size.width - w) / 2, y: 0, width: w, height: 44)
     }
 
@@ -95,6 +102,22 @@ final class OverlayPanel {
         }
     }
 
+    /// Shows the "meeting detected" reminder above the bar for 20 s.
+    func showMeetingPrompt(_ text: String) {
+        promptWork?.cancel()
+        withAnimation(.easeOut(duration: 0.18)) { model.meetingPrompt = text }
+        position()
+        panel.orderFrontRegardless()
+        let work = DispatchWorkItem { [weak self] in self?.dismissMeetingPrompt() }
+        promptWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: work)
+    }
+
+    func dismissMeetingPrompt() {
+        promptWork?.cancel()
+        withAnimation(.easeOut(duration: 0.18)) { model.meetingPrompt = nil }
+    }
+
     /// Bottom-center of the screen that has the mouse (Wispr: data-bar-position="bottom").
     private func position() {
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
@@ -111,7 +134,14 @@ final class OverlayPanel {
         clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
             guard let self, event.window === self.panel else { return event }
             let p = event.locationInWindow
-            if self.hotRect.contains(p) { self.onClick() }
+            if self.hotRect.contains(p) {
+                if self.model.meetingPrompt != nil && self.model.phase == .hidden {
+                    self.dismissMeetingPrompt()
+                    self.onMeetingPromptClick()
+                } else {
+                    self.onClick()
+                }
+            }
             return nil
         }
     }
@@ -150,6 +180,9 @@ struct FlowBarView: View {
         switch model.phase {
         case .message(let text, _), .loading(let text): return (text, nil)
         case .recording where model.handsFree: return ("Clique para parar", nil)
+        case .hidden where model.meetingPrompt != nil: return (model.meetingPrompt!, nil)
+        case .hidden where model.hovering && model.meetingRecording:
+            return ("Notetaker gravando · clique ou segure", HotkeyMonitor.Trigger(rawValue: hotkey)?.label ?? "fn")
         case .hidden where model.hovering:
             return ("Clique ou segure", HotkeyMonitor.Trigger(rawValue: hotkey)?.label ?? "fn")
         default: return nil
@@ -186,6 +219,19 @@ private struct Pill: View {
     var body: some View {
         ZStack {
             switch state {
+            case .meeting:
+                Capsule().fill(Color.black.opacity(0.8))
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.5), lineWidth: 1))
+                    .overlay(RecordingDot())
+                    .frame(width: 40, height: 14)
+            case .prompt:
+                Capsule().fill(Color.black)
+                    .overlay(Capsule().strokeBorder(DS.vast700, lineWidth: 1))
+                    .overlay(HStack(spacing: 6) {
+                        RecordingDot()
+                        Text("Iniciar").font(DS.ui(13, DS.w550)).foregroundColor(.white)
+                    })
+                    .frame(width: 84, height: 30)
             case .resting:
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.black.opacity(0.5))
@@ -224,15 +270,29 @@ private struct Pill: View {
         .animation(.timingCurve(0.05, 0.6, 0.4, 0.95, duration: 0.18), value: state)
     }
 
-    private enum VisualState { case resting, ready, recording, processing, error }
+    private enum VisualState { case resting, ready, recording, processing, error, meeting, prompt }
 
     private var state: VisualState {
         switch model.phase {
         case .recording: return .recording
         case .transcribing, .loading: return .processing
         case .message(_, let isError): return isError ? .error : (model.hovering ? .ready : .resting)
-        case .hidden: return model.hovering ? .ready : .resting
+        case .hidden:
+            if model.meetingPrompt != nil { return .prompt }
+            if model.hovering { return .ready }
+            return model.meetingRecording ? .meeting : .resting
         }
+    }
+}
+
+/// Pulsing red dot used for Notetaker recording.
+struct RecordingDot: View {
+    @State private var on = false
+    var body: some View {
+        Circle().fill(DS.destructive500).frame(width: 7, height: 7)
+            .opacity(on ? 1 : 0.35)
+            .animation(.easeInOut(duration: 0.9).repeatForever(), value: on)
+            .onAppear { on = true }
     }
 }
 

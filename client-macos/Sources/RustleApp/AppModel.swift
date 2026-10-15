@@ -61,6 +61,23 @@ final class AppModel: ObservableObject {
     @Published var history: [HistoryEntry] = [] { didSet { save(history, "history.json") } }
     @Published var notes: [Note] = [] { didSet { save(notes, "notes.json") } }
     @Published var serverSettings = ServerSettings() { didSet { save(serverSettings, "settings.json") } }
+    @Published var meetings: [Meeting] = [] { didSet { save(meetings, "meetings.json") } }
+
+    // MARK: Notetaker live state
+
+    /// The meeting being recorded, if any.
+    @Published var activeMeetingID: UUID?
+    /// Meeting app seen by MeetingDetector while nothing is recording ("Reunião detectada no Zoom").
+    @Published var detectedMeetingApp: String?
+    /// Why system audio could not be captured (permission, macOS version); nil when it works.
+    @Published var systemAudioError: String?
+    /// Meeting whose summary or chat answer is being generated.
+    @Published var busyMeetingIDs: Set<UUID> = []
+    /// Navigation requests from outside the window (menu bar, Flow bar prompt).
+    @Published var pageRequest: MainView.Page?
+    @Published var openMeetingID: UUID?
+    /// Live levels live in their own object so the waveform does not redraw every page.
+    let meetingLevels = MeetingLevels()
 
     // MARK: Status
 
@@ -84,6 +101,11 @@ final class AppModel: ObservableObject {
     var relaunch: () -> Void = {}
     var restartServer: () -> Void = {}
     var hotkeyChanged: () -> Void = {}
+    /// Starts Notetaker (optionally for a detected app) and returns the new meeting's ID.
+    var startMeeting: (String?) -> UUID? = { _ in nil }
+    var stopMeeting: () -> Void = {}
+    var generateNotes: (UUID) -> Void = { _ in }
+    var askMeeting: (UUID, String) -> Void = { _, _ in }
 
     // MARK: Persistence
 
@@ -104,6 +126,12 @@ final class AppModel: ObservableObject {
         history = load("history.json") ?? []
         notes = load("notes.json") ?? []
         serverSettings = load("settings.json") ?? ServerSettings()
+        meetings = load("meetings.json") ?? []
+        // A meeting left "recording" by a crash or quit is finished now.
+        for i in meetings.indices where meetings[i].status != .ready {
+            meetings[i].status = .ready
+            meetings[i].ended = meetings[i].ended ?? meetings[i].segments.last.map { meetings[i].started.addingTimeInterval($0.end) }
+        }
         loading = false
         // Make sure the server has a settings file to read on first launch.
         if persist, !FileManager.default.fileExists(atPath: Self.settingsURL.path) { save(serverSettings, "settings.json") }
@@ -112,6 +140,40 @@ final class AppModel: ObservableObject {
     func record(_ entry: HistoryEntry) {
         history.insert(entry, at: 0)
         if history.count > 500 { history.removeLast(history.count - 500) }
+    }
+
+    // MARK: Notetaker
+
+    func meeting(_ id: UUID) -> Meeting? { meetings.first { $0.id == id } }
+
+    func updateMeeting(_ id: UUID, _ change: (inout Meeting) -> Void) {
+        guard let i = meetings.firstIndex(where: { $0.id == id }) else { return }
+        change(&meetings[i])
+    }
+
+    /// Adds transcribed segments. Without headphones the mic also hears the other people, so a
+    /// "Você" line that repeats an overlapping "Outros" line is dropped as echo.
+    func appendSegments(_ new: [Meeting.Segment], to id: UUID) {
+        updateMeeting(id) { m in
+            for seg in new {
+                if seg.speaker == .you,
+                   m.segments.contains(where: { $0.speaker == .them && Self.isEcho(seg, of: $0) }) { continue }
+                if seg.speaker == .them {
+                    m.segments.removeAll { $0.speaker == .you && Self.isEcho($0, of: seg) }
+                }
+                m.segments.append(seg)
+            }
+        }
+    }
+
+    private static func isEcho(_ mic: Meeting.Segment, of system: Meeting.Segment) -> Bool {
+        guard mic.start < system.end + 4, mic.end > system.start - 4 else { return false }
+        func words(_ s: String) -> Set<String> {
+            Set(s.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count > 2 })
+        }
+        let a = words(mic.text), b = words(system.text)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return Double(a.intersection(b).count) / Double(min(a.count, b.count)) >= 0.6
     }
 
     var totalWords: Int { history.reduce(0) { $0 + $1.words } }
@@ -156,6 +218,20 @@ final class AppModel: ObservableObject {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(value) else { return }
         try? data.write(to: Self.directory.appendingPathComponent(name), options: .atomic)
+    }
+}
+
+/// Mic / system audio levels while Notetaker records (0…1, log-scaled for display).
+@MainActor
+final class MeetingLevels: ObservableObject {
+    @Published var bars: [CGFloat] = Array(repeating: 0, count: 15)
+    @Published var elapsed: TimeInterval = 0
+
+    func push(mic: Float, system: Float) {
+        let level = max(mic, system)
+        let db = 20 * log10(max(level, 1e-5))
+        bars.removeFirst()
+        bars.append(CGFloat(max(0, min(1, (db + 55) / 45))))
     }
 }
 

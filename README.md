@@ -95,3 +95,18 @@ System Settings → Privacy & Security. Set `Keyboard → "Press 🌐 key to"` t
 - Check that a paste succeeded using delayed pasteboard rendering (`NSPasteboardItemDataProvider`).
 - Fall back to setting `AXValue` directly for apps that ignore Cmd+V.
 - Learn new dictionary words from edits made right after a paste.
+
+## Notetaker (reuniões)
+
+Rebuilt from Wispr Flow's Notetaker (evidence from REA: `MacCatapSystemAudioLoopbackCapture` /
+`getDisplayMedia` loopback for system audio, a separate mic graph, `hub_meeting_*` UI strings and CSS modules).
+
+- **Captura**: microfone = "Você", áudio do sistema = "Outros" (Core Audio process tap, macOS 14.2+;
+  permissão "Gravação de áudio do sistema" pedida na primeira gravação). Cada fluxo é cortado nas pausas
+  (6–25 s) e enviado a `POST /v1/transcribe`. Eco do alto-falante captado pelo mic é descartado.
+- **Detecção**: Zoom, Teams, FaceTime, Webex, Slack huddle, Google Meet no navegador (título da janela),
+  quando o app está usando o microfone → "Reunião detectada" no Flow bar; clique para iniciar.
+- **Depois da reunião**: `POST /v1/notes` gera título, resumo em seções e itens de ação. Com chave da
+  Anthropic (Configurações) usa Claude; sem chave, resumo extrativo local.
+- **Chat**: `POST /v1/notes/ask` ("O que eu perdi?", e-mail de follow-up…).
+- Dados em `~/Library/Application Support/RustleApp/meetings.json`.

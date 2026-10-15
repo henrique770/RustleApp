@@ -16,6 +16,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/RustleApp"
 # Figtree + EB Garamond (SIL OFL), registered through ATSApplicationFontsPath.
 cp -R "$CLIENT/Resources/Fonts" "$APP/Contents/Resources/Fonts"
+# Same mark as the sidebar logo (regenerate with scripts/make-icon.swift + iconutil).
+cp "$CLIENT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -25,12 +27,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>RustleApp</string>
   <key>CFBundleDisplayName</key><string>RustleApp</string>
   <key>CFBundleExecutable</key><string>RustleApp</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>ATSApplicationFontsPath</key><string>Fonts</string>
-  <key>NSMicrophoneUsageDescription</key><string>RustleApp records your voice while you hold the dictation key.</string>
+  <key>NSMicrophoneUsageDescription</key><string>O RustleApp grava sua voz para ditado e para o Notetaker.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>O Notetaker grava o áudio das chamadas (os outros participantes) para transcrever a reunião.</string>
 </dict>
 </plist>
 PLIST

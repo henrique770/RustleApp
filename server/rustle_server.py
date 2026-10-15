@@ -3,7 +3,10 @@
 Plays the role of Wispr Flow's cloud TranscriptionService (transcriber -> formatter),
 but runs on your machine with an open-source Whisper model.
 
-    POST /v1/dictate  {"audio_wav_b64": "...", "context": {...}}  ->  {"raw", "text", "formatter", "latency_ms"}
+    POST /v1/dictate     {"audio_wav_b64": "...", "context": {...}}  ->  {"raw", "text", "formatter", "latency_ms"}
+    POST /v1/transcribe  {"audio_wav_b64": "...", "language"}        ->  {"segments": [{"start", "end", "text"}]}
+    POST /v1/notes       {"transcript": [...], "user_notes", ...}     ->  {"title", "summary", "action_items", "engine"}
+    POST /v1/notes/ask   {"question", "transcript", ...}              ->  {"answer", "engine"}
     GET  /health
 """
 
@@ -22,6 +25,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from formatter import Formatter, SettingsStore
+from notes import NotesWriter
 
 log = logging.getLogger("rustle")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -33,7 +37,7 @@ WHISPER_COMPUTE = os.environ.get("RUSTLE_WHISPER_COMPUTE", "int8")
 WHISPER_LANGUAGE = os.environ.get("RUSTLE_LANGUAGE") or None
 MAX_AUDIO_SECONDS = 600
 # Bumped when the app/server contract changes; the desktop app restarts older servers.
-API_VERSION = 3
+API_VERSION = 4
 
 
 class Context(BaseModel):
@@ -57,6 +61,54 @@ class DictateResponse(BaseModel):
     latency_ms: int
 
 
+class TranscribeRequest(BaseModel):
+    audio_wav_b64: str
+    language: Optional[str] = None
+
+
+class Segment(BaseModel):
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptLine(BaseModel):
+    speaker: str
+    start: float = 0
+    text: str
+
+
+class NotesRequest(BaseModel):
+    transcript: list[TranscriptLine] = []
+    user_notes: str = ""
+    title: str = ""
+    language: Optional[str] = None
+
+
+class SummarySection(BaseModel):
+    heading: str
+    bullets: list[str]
+
+
+class ActionItem(BaseModel):
+    text: str
+    owner: str = ""
+
+
+class NotesResponse(BaseModel):
+    title: str
+    summary: list[SummarySection]
+    action_items: list[ActionItem]
+    engine: str
+
+
+class AskRequest(BaseModel):
+    question: str
+    transcript: list[TranscriptLine] = []
+    user_notes: str = ""
+    summary: list[SummarySection] = []
+
+
 class Transcriber:
     def __init__(self) -> None:
         from faster_whisper import WhisperModel
@@ -77,6 +129,19 @@ class Transcriber:
         )
         return " ".join(s.text.strip() for s in segments).strip()
 
+    def segments(self, audio: np.ndarray, vocabulary: list[str], language: Optional[str]) -> list[Segment]:
+        """Timed segments for meeting chunks (Notetaker), with the same vocabulary bias."""
+        prompt = ", ".join(vocabulary[:100]) or None
+        segments, _ = self.model.transcribe(
+            audio,
+            beam_size=5,
+            language=None if WHISPER_MODEL.endswith(".en") else language,
+            vad_filter=True,
+            initial_prompt=prompt,
+            condition_on_previous_text=False,
+        )
+        return [Segment(start=s.start, end=s.end, text=s.text.strip()) for s in segments if s.text.strip()]
+
 
 def decode_wav(data: bytes) -> np.ndarray:
     try:
@@ -93,6 +158,7 @@ def decode_wav(data: bytes) -> np.ndarray:
 
 app = FastAPI(title="rustle-server")
 formatter = Formatter(SettingsStore())
+notes_writer = NotesWriter()
 transcriber: Optional[Transcriber] = None
 
 
@@ -105,7 +171,7 @@ def _load() -> None:
 @app.get("/health")
 def health() -> dict:
     return {"ok": transcriber is not None, "api_version": API_VERSION, "model": WHISPER_MODEL, "language": WHISPER_LANGUAGE or "auto",
-            "llm": formatter.llm_enabled}
+            "llm": formatter.llm_enabled, "notes_llm": notes_writer.claude_available}
 
 
 @app.post("/v1/dictate", response_model=DictateResponse)
@@ -128,6 +194,42 @@ def dictate(req: DictateRequest) -> DictateResponse:
     log.info("dictation app=%s raw_len=%d out_len=%d formatter=%s %dms",
              ctx.get("bundleId"), len(raw), len(text), used, latency)
     return DictateResponse(raw=raw, text=text, formatter=used, latency_ms=latency)
+
+
+def _language(requested: Optional[str]) -> Optional[str]:
+    language = requested if requested else WHISPER_LANGUAGE
+    return None if language == "auto" else language
+
+
+@app.post("/v1/transcribe")
+def transcribe(req: TranscribeRequest) -> dict:
+    """Raw timed transcription of one meeting chunk; no formatting (the notes stage does that)."""
+    if transcriber is None:
+        raise HTTPException(503, "model not loaded")
+    started = time.perf_counter()
+    try:
+        audio = decode_wav(base64.b64decode(req.audio_wav_b64, validate=True))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    segments = transcriber.segments(audio, formatter.settings.dictionary, _language(req.language))
+    latency = int((time.perf_counter() - started) * 1000)
+    log.info("meeting chunk %.1fs -> %d segments %dms", len(audio) / 16000, len(segments), latency)
+    return {"segments": [s.model_dump() for s in segments], "latency_ms": latency}
+
+
+@app.post("/v1/notes", response_model=NotesResponse)
+def notes(req: NotesRequest) -> dict:
+    started = time.perf_counter()
+    result = notes_writer.notes([t.model_dump() for t in req.transcript], req.user_notes, req.title, req.language)
+    log.info("notes for %d lines via %s in %dms", len(req.transcript), result.get("engine"),
+             int((time.perf_counter() - started) * 1000))
+    return result
+
+
+@app.post("/v1/notes/ask")
+def ask(req: AskRequest) -> dict:
+    return notes_writer.ask(req.question, [t.model_dump() for t in req.transcript], req.user_notes,
+                            [s.model_dump() for s in req.summary])
 
 
 @app.post("/v1/shutdown")

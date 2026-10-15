@@ -20,6 +20,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var permissionTimer: Timer?
     private var capturedContext: FocusContext.Snapshot?
     private var isRecording = false
+    private let notetaker = NotetakerClient(baseURL: Config.serverURL)
+    private lazy var meetingRecorder = MeetingRecorder(client: notetaker)
+    private let meetingDetector = MeetingDetector()
+    private var meetingClock: Timer?
+    private var notetakerMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("RustleApp started (hotkey=\(Config.trigger.rawValue), server=\(Config.serverURL), bundle=\(Bundle.main.bundlePath))")
@@ -44,6 +49,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated { self?.refreshPermissions() }
         }
 
+        overlay.onMeetingPromptClick = { [weak self] in
+            guard let self else { return }
+            if let id = self.startMeeting(app: self.model.detectedMeetingApp) { self.openMeeting(id) }
+        }
+        meetingDetector.shouldCheck = { [weak self] in self?.model.activeMeetingID == nil }
+        meetingDetector.onMeetingStarted = { [weak self] app in
+            guard let self, self.model.activeMeetingID == nil else { return }
+            self.model.detectedMeetingApp = app
+            self.overlay.showMeetingPrompt("Reunião detectada no \(app) · clique para iniciar o Notetaker")
+        }
+        meetingDetector.onMeetingEnded = { [weak self] in
+            self?.model.detectedMeetingApp = nil
+            self?.overlay.dismissMeetingPrompt()
+        }
+        meetingDetector.start()
+
         showMainWindow()
         Task { await startServer() }
     }
@@ -54,6 +75,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let id = model.activeMeetingID {
+            model.updateMeeting(id) { $0.status = .ready; $0.ended = Date() }
+        }
         server.stop()
     }
 
@@ -127,6 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setIcon("waveform", tip: "RustleApp")
         let menu = NSMenu()
         menu.addItem(item("Abrir RustleApp", #selector(showMainWindow)))
+        let notetakerItem = item("Iniciar Notetaker", #selector(toggleNotetakerFromMenu))
+        menu.addItem(notetakerItem)
+        notetakerMenuItem = notetakerItem
         menu.addItem(item("Testar colagem (em 3 s)", #selector(testPasteFromMenu)))
         menu.addItem(.separator())
         menu.addItem(withTitle: "Sair do RustleApp", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -153,6 +180,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { await self.restartServer() }
         }
         model.hotkeyChanged = { [weak self] in self?.startHotkey() }
+        model.startMeeting = { [weak self] app in self?.startMeeting(app: app) }
+        model.stopMeeting = { [weak self] in self?.stopMeeting() }
+        model.generateNotes = { [weak self] id in self?.generateNotes(for: id) }
+        model.askMeeting = { [weak self] id, question in self?.ask(question, about: id) }
+    }
+
+    private func openMeeting(_ id: UUID) {
+        model.openMeetingID = id
+        model.pageRequest = .notetaker
+        showMainWindow()
     }
 
     // MARK: - Server
@@ -329,6 +366,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 model.serverState = .offline("Sem resposta do servidor")
                 overlay.show(.message("Erro: \(error.localizedDescription)", isError: true), autoHideAfter: 6)
             }
+        }
+    }
+
+    // MARK: - Notetaker
+
+    @objc private func toggleNotetakerFromMenu() {
+        if model.activeMeetingID != nil {
+            stopMeeting()
+        } else if let id = startMeeting(app: model.detectedMeetingApp) {
+            openMeeting(id)
+        }
+    }
+
+    /// Wispr: "New note — opens notepad and starts Notetaker". Records mic + system audio.
+    @discardableResult
+    private func startMeeting(app: String?) -> UUID? {
+        if let active = model.activeMeetingID { return active }
+        let meeting = Meeting(appName: app)
+        model.meetings.insert(meeting, at: 0)
+        let id = meeting.id
+        meetingRecorder.onSegments = { [weak self] segments in self?.model.appendSegments(segments, to: id) }
+        meetingRecorder.onLevels = { [weak self] mic, system in self?.model.meetingLevels.push(mic: mic, system: system) }
+        do {
+            try meetingRecorder.start(language: Config.language)
+        } catch {
+            model.meetings.removeAll { $0.id == id }
+            overlay.show(.message("Notetaker: \(error.localizedDescription)", isError: true), autoHideAfter: 6)
+            return nil
+        }
+        model.activeMeetingID = id
+        model.systemAudioError = meetingRecorder.systemAudioError
+        model.detectedMeetingApp = nil
+        model.meetingLevels.elapsed = 0
+        overlay.dismissMeetingPrompt()
+        overlay.model.meetingRecording = true
+        notetakerMenuItem?.title = "Parar Notetaker"
+        setIcon("record.circle", tip: "Notetaker gravando")
+        meetingClock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let m = self.model.meeting(id) else { return }
+                self.model.meetingLevels.elapsed = Date().timeIntervalSince(m.started)
+            }
+        }
+        if model.serverState != .online {
+            Task { if await server.ensureRunning(timeout: 60) == nil { model.serverState = .online } }
+        }
+        return id
+    }
+
+    private func stopMeeting() {
+        guard let id = model.activeMeetingID else { return }
+        model.activeMeetingID = nil
+        meetingClock?.invalidate()
+        meetingClock = nil
+        model.updateMeeting(id) { $0.ended = Date(); $0.status = .processing }
+        overlay.model.meetingRecording = false
+        notetakerMenuItem?.title = "Iniciar Notetaker"
+        setIcon("waveform", tip: "RustleApp")
+        Task {
+            await meetingRecorder.stop()
+            generateNotes(for: id)
+        }
+    }
+
+    /// Post-meeting "Enhanced Summary" and "Action Items" (Claude when a key is set, else local).
+    private func generateNotes(for id: UUID) {
+        guard let meeting = model.meeting(id), !model.busyMeetingIDs.contains(id) else { return }
+        model.busyMeetingIDs.insert(id)
+        model.updateMeeting(id) { $0.status = .processing }
+        Task {
+            defer {
+                model.busyMeetingIDs.remove(id)
+                model.updateMeeting(id) { $0.status = .ready }
+            }
+            do {
+                let notes = try await notetaker.notes(for: meeting, language: Config.language)
+                model.updateMeeting(id) { m in
+                    m.summary = notes.summary
+                    // Keep items the user already checked off or added by hand.
+                    let kept = m.actionItems.filter { $0.done }
+                    m.actionItems = kept + notes.action_items.map { Meeting.ActionItem(text: $0.text, owner: $0.owner) }
+                    m.summaryEngine = notes.engine
+                    if m.title.trimmingCharacters(in: .whitespaces).isEmpty, !notes.title.isEmpty { m.title = notes.title }
+                }
+                Log.info("meeting notes via \(notes.engine): \(notes.summary.count) sections, \(notes.action_items.count) actions")
+            } catch {
+                Log.info("meeting notes failed: \(error.localizedDescription)")
+                overlay.show(.message("Resumo: \(error.localizedDescription)", isError: true), autoHideAfter: 6)
+            }
+        }
+    }
+
+    private func ask(_ question: String, about id: UUID) {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, let meeting = model.meeting(id) else { return }
+        model.updateMeeting(id) { $0.chat.append(.init(fromUser: true, text: q)) }
+        model.busyMeetingIDs.insert(id)
+        Task {
+            defer { model.busyMeetingIDs.remove(id) }
+            let answer: String
+            do { answer = try await notetaker.ask(q, about: meeting) } catch { answer = "Algo deu errado: \(error.localizedDescription)" }
+            model.updateMeeting(id) { $0.chat.append(.init(fromUser: false, text: answer)) }
         }
     }
 
