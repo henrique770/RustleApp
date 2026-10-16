@@ -925,14 +925,45 @@ private struct NoteRow: View {
 
 /// .container { padding:48px; gap:36px } .section { gap:16px } .card { padding:20; radius:12; tertiary }
 /// rows: label 15/550 + description neutral-600, controls 164 px.
+/// Paste-and-save field for one provider's API key (stored in the Keychain).
+private struct APIKeyField: View {
+    let title: String
+    let placeholder: String
+    @Binding var key: String
+    @Binding var saved: Bool
+    let save: () -> Bool
+    let onSaved: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(DS.ui(15, DS.w550))
+            HStack(spacing: 8) {
+                SecureField("", text: $key, prompt: Text(placeholder).foregroundColor(DS.vast500))
+                    .textFieldStyle(.plain).font(DS.ui(15))
+                    .padding(.horizontal, 12).frame(height: 36)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(DS.card))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(DS.border, lineWidth: 1))
+                    .onChange(of: key) { _ in saved = false }
+                Button(saved ? "Salva ✓" : "Salvar") {
+                    saved = save()
+                    onSaved()
+                }.buttonStyle(PrimaryButtonStyle())
+            }
+        }
+    }
+}
+
 private struct SettingsPage: View {
     @ObservedObject var model: AppModel
     @AppStorage(Prefs.hotkey) private var hotkey = "fn"
     @AppStorage(Prefs.language) private var language = "pt"
     @AppStorage(Prefs.whisperModel) private var whisperModel = "small"
+    @AppStorage(Prefs.meetingWhisperModel) private var meetingWhisperModel = "large-v3-turbo"
     @AppStorage(Prefs.scratchpadOpenBehavior) private var scratchpadOpen = "resume"
     @State private var apiKey = Keychain.readAPIKey() ?? ""
     @State private var keySaved = false
+    @State private var deepseekKey = Keychain.readAPIKey(Keychain.deepseek) ?? ""
+    @State private var deepseekSaved = false
 
     var body: some View {
         ScrollView {
@@ -1007,6 +1038,14 @@ private struct SettingsPage: View {
                                 Text("base (rápido)").tag("base")
                                 Text("small (recomendado)").tag("small")
                                 Text("medium (preciso)").tag("medium")
+                                Text("large-v3-turbo (melhor em português)").tag("large-v3-turbo")
+                            }.labelsHidden()
+                        }
+                        SettingsRow(label: "Modelo das reuniões (Notetaker)", description: "As reuniões rodam em segundo plano, então podem usar um modelo maior e mais preciso. O turbo baixa ~1,6 GB na primeira vez. Trocar exige reiniciar o servidor.") {
+                            Picker("", selection: $meetingWhisperModel) {
+                                Text("Igual ao ditado").tag("")
+                                Text("medium").tag("medium")
+                                Text("large-v3-turbo (recomendado)").tag("large-v3-turbo")
                             }.labelsHidden()
                         }
                         SettingsRow(label: "Servidor de transcrição", description: serverDescription) {
@@ -1017,24 +1056,23 @@ private struct SettingsPage: View {
 
                 SettingsSection(title: "Polimento com IA") {
                     SettingsCard {
-                        SettingsRow(label: "Reescrever com Claude", description: "Remove hesitações e autocorreções e ajusta o tom ao app em uso. Opcional; sem chave, usa só regras locais.") {
+                        SettingsRow(label: "Reescrever ditados com IA", description: "Remove hesitações e autocorreções e ajusta o tom ao app em uso. Opcional; sem chave, usa só regras locais.") {
                             Toggle("", isOn: $model.serverSettings.use_claude).toggleStyle(.switch).labelsHidden()
                         }
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Chave da API Anthropic").font(DS.ui(15, DS.w550))
-                            HStack(spacing: 8) {
-                                SecureField("", text: $apiKey, prompt: Text("sk-ant-…").foregroundColor(DS.vast500))
-                                    .textFieldStyle(.plain).font(DS.ui(15))
-                                    .padding(.horizontal, 12).frame(height: 36)
-                                    .background(RoundedRectangle(cornerRadius: 8).fill(DS.card))
-                                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(DS.border, lineWidth: 1))
-                                Button(keySaved ? "Salva ✓" : "Salvar") {
-                                    keySaved = Keychain.saveAPIKey(apiKey)
-                                    model.restartServer()
-                                }.buttonStyle(PrimaryButtonStyle())
-                            }
-                            Text("Guardada no Chaveiro do macOS.").font(DS.ui(13)).foregroundColor(DS.foregroundTertiary)
+                        SettingsRow(label: "Provedor de IA", description: "Usado no polimento, resumos de reuniões, perguntas e Scratchpad. Se faltar a chave dele, usa o outro.") {
+                            Picker("", selection: $model.serverSettings.ai_provider) {
+                                Text("Claude").tag("claude")
+                                Text("DeepSeek").tag("deepseek")
+                            }.labelsHidden()
                         }
+                        APIKeyField(title: "Chave da API Anthropic", placeholder: "sk-ant-…", key: $apiKey, saved: $keySaved) {
+                            Keychain.saveAPIKey(apiKey, account: Keychain.anthropic)
+                        } onSaved: { model.restartServer() }
+                        APIKeyField(title: "Chave da API DeepSeek", placeholder: "sk-…", key: $deepseekKey, saved: $deepseekSaved) {
+                            Keychain.saveAPIKey(deepseekKey, account: Keychain.deepseek)
+                        } onSaved: { model.restartServer() }
+                        Text("Guardadas no Chaveiro do macOS. Deixe vazio e salve para remover.")
+                            .font(DS.ui(13)).foregroundColor(DS.foregroundTertiary)
                     }
                 }
 

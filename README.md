@@ -101,6 +101,11 @@ O último comando remove as permissões que o app recebeu. Depois disso, apague 
    unavailable, slow (8 s timeout) or refused, the server quietly uses the rule-based output instead.
    Uses `claude-opus-5-5` at low effort with server-side refusal fallback enabled. Override the model
    with `RUSTLE_CLAUDE_MODEL`.
+3. **DeepSeek API** (optional, alternative to Claude). Paste the key in Configurações → Polimento com IA
+   (stored in the Keychain, passed to the server as `DEEPSEEK_API_KEY`) and pick "DeepSeek" as the
+   provider (`ai_provider` in `rustle.json`, or `RUSTLE_LLM=deepseek`). It powers the dictation polish,
+   meeting notes, meeting chat and Scratchpad transforms. When the preferred provider has no key, the
+   other one is used. Model `deepseek-chat` by default; override with `RUSTLE_DEEPSEEK_MODEL`.
 
 No account, auth server, or telemetry is involved.
 

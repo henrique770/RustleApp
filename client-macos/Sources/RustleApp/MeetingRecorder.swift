@@ -13,6 +13,10 @@ final class MeetingRecorder {
     var onSegments: (([Meeting.Segment]) -> Void)?
     /// Mic and system levels (0…1 RMS) for the live waveform.
     var onLevels: ((Float, Float) -> Void)?
+    /// Proofread text for segments already delivered through `onSegments` (same ids).
+    var onCorrected: (([UUID: String]) -> Void)?
+    /// Recent transcript lines, given to the corrector as context.
+    var recentTranscript: (() -> String)?
 
     private(set) var isRecording = false
     private(set) var systemAudioError: String?
@@ -23,6 +27,7 @@ final class MeetingRecorder {
     private let buffers = Buffers()
     private var timer: Timer?
     private var queue: Task<Void, Never>?
+    private var corrections: [Task<Void, Never>] = []
     private var language = "pt"
     private var micLevel: Float = 0
     private var sysLevel: Float = 0
@@ -31,6 +36,9 @@ final class MeetingRecorder {
     nonisolated static let minChunk = 6.0
     nonisolated static let maxChunk = 25.0
     nonisolated static let pauseWindow = 0.7
+    /// 20 ms loudness frames for the bleed check.
+    nonisolated static let frameSamples = 320
+    nonisolated static let frameSeconds = 0.02
 
     /// Buffered PCM16 per speaker, filled from audio threads and drained on the main actor.
     private final class Buffers: @unchecked Sendable {
@@ -42,19 +50,51 @@ final class MeetingRecorder {
         }
         struct Chunk { let pcm: Data; let offset: Double; let speaker: Meeting.Speaker; let silence: Float }
 
+        /// Loudness every 20 ms for the whole meeting, per stream: compared to tell the user's
+        /// voice from the call leaking into the mic (see `MeetingRecorder.bleedScore`).
+        struct Envelope {
+            var frames: [Float] = []
+            var sum: Float = 0
+            var count = 0
+
+            mutating func add(_ pcm: Data) {
+                pcm.withUnsafeBytes { raw in
+                    for s in raw.bindMemory(to: Int16.self) {
+                        let f = Float(s) / 32768
+                        sum += f * f
+                        count += 1
+                        if count == MeetingRecorder.frameSamples {
+                            frames.append((sum / Float(count)).squareRoot())
+                            sum = 0
+                            count = 0
+                        }
+                    }
+                }
+            }
+        }
+
         private let lock = NSLock()
         private var mic = Stream(speaker: .you, silence: 0.010)
         private var sys = Stream(speaker: .them, silence: 0.004)
+        private var micEnv = Envelope()
+        private var sysEnv = Envelope()
 
         func reset() {
             lock.lock(); defer { lock.unlock() }
             mic = Stream(speaker: .you, silence: 0.010)
             sys = Stream(speaker: .them, silence: 0.004)
+            micEnv = Envelope()
+            sysEnv = Envelope()
         }
 
         func append(_ pcm: Data, mic toMic: Bool) {
             lock.lock(); defer { lock.unlock() }
-            if toMic { mic.pcm.append(pcm) } else { sys.pcm.append(pcm) }
+            if toMic { mic.pcm.append(pcm); micEnv.add(pcm) } else { sys.pcm.append(pcm); sysEnv.add(pcm) }
+        }
+
+        func envelopes() -> (mic: [Float], sys: [Float]) {
+            lock.lock(); defer { lock.unlock() }
+            return (micEnv.frames, sysEnv.frames)
         }
 
         /// Cuts a chunk at a pause (or at the max length); `final` takes whatever is left.
@@ -84,6 +124,9 @@ final class MeetingRecorder {
         buffers.reset()
 
         let input = micEngine.inputNode
+        // No voice processing (macOS echo cancellation) here: while it runs, the system-audio tap
+        // stops delivering, so the other people would not be recorded. Echo is filtered by text instead
+        // (AppModel.isEcho).
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0 else {
             throw NSError(domain: "RustleApp", code: 1, userInfo: [NSLocalizedDescriptionKey: "Nenhum microfone disponível"])
@@ -137,6 +180,9 @@ final class MeetingRecorder {
         flush(mic: true, final: true)
         flush(mic: false, final: true)
         await queue?.value
+        // The summary should be written from the corrected transcript.
+        for task in corrections { await task.value }
+        corrections.removeAll()
         Log.info("meeting recording stopped")
     }
 
@@ -174,14 +220,86 @@ final class MeetingRecorder {
             let wav = AudioRecorder.wav(pcm16: pcm, sampleRate: Int(Self.rate))
             do {
                 let parts = try await client.transcribe(wav: wav, language: language)
-                let segments = parts.map {
+                var segments = parts.map {
                     Meeting.Segment(speaker: speaker, start: offset + $0.start, end: offset + $0.end, text: $0.text)
                 }
-                if !segments.isEmpty { self?.onSegments?(segments) }
+                if speaker == .you, let self { segments = self.droppingBleed(segments) }
+                if !segments.isEmpty {
+                    self?.onSegments?(segments)
+                    self?.correct(segments, speaker: speaker)
+                }
             } catch {
                 Log.info("meeting chunk failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// Mic lines whose loudness rises and falls with the call audio are the call leaking into the
+    /// mic (headphones, speakers), not the user, even when Whisper hears different words.
+    private func droppingBleed(_ segments: [Meeting.Segment]) -> [Meeting.Segment] {
+        let env = buffers.envelopes()
+        return segments.filter { seg in
+            let a = Int(seg.start / Self.frameSeconds), b = Int(seg.end / Self.frameSeconds)
+            guard let score = Self.bleedScore(mic: env.mic, sys: env.sys, from: a, to: b) else { return true }
+            let bleed = score >= Self.bleedThreshold
+            Log.info("mic line bleed score \(String(format: "%.2f", score))\(bleed ? " -> dropped" : ""): \(seg.text)")
+            return !bleed
+        }
+    }
+
+    nonisolated static let bleedThreshold: Float = 0.5
+
+    /// Best correlation (over ±300 ms of lag) between the mic and system loudness in frames
+    /// [from, to). Pearson ignores scale, so faint bleed still scores ~1; tested on speech: bleed
+    /// 0.99 at any level, the user's own voice ≤ 0.12 even over the call. nil when the call was quiet
+    /// then (nothing could have leaked) or the window is too short to judge.
+    nonisolated static func bleedScore(mic: [Float], sys: [Float], from: Int, to: Int) -> Float? {
+        let maxLag = 15
+        let a = max(0, from), b = min(to, mic.count)
+        guard b - a >= 10, a < sys.count else { return nil }
+        let sysWindow = sys[a..<min(b, sys.count)]
+        guard !sysWindow.isEmpty, sysWindow.reduce(0, +) / Float(sysWindow.count) > 0.003 else { return nil }
+        var best: Float = -1
+        for lag in -maxLag...maxLag {
+            // Bleed arrives in the mic after (or, with clock skew, slightly before) the system audio:
+            // mic[i] is compared with sys[i - lag], over the part of the window both streams cover.
+            let lo = max(a, lag), hi = min(b, sys.count + lag)
+            guard hi - lo >= 10 else { continue }
+            best = max(best, pearson(Array(mic[lo..<hi]), Array(sys[(lo - lag)..<(hi - lag)])))
+        }
+        return best
+    }
+
+    nonisolated static func pearson(_ x: [Float], _ y: [Float]) -> Float {
+        let n = Float(x.count)
+        let mx = x.reduce(0, +) / n, my = y.reduce(0, +) / n
+        var sxy: Float = 0, sxx: Float = 0, syy: Float = 0
+        for i in x.indices {
+            let dx = x[i] - mx, dy = y[i] - my
+            sxy += dx * dy; sxx += dx * dx; syy += dy * dy
+        }
+        guard sxx > 0, syy > 0 else { return 0 }
+        return sxy / (sxx * syy).squareRoot()
+    }
+
+    /// Shows the raw text right away, then swaps in the AI-corrected text. Runs beside the
+    /// transcription queue so a slow LLM never delays the next chunk.
+    private func correct(_ segments: [Meeting.Segment], speaker: Meeting.Speaker) {
+        let client = client
+        let language = language
+        let context = recentTranscript?() ?? ""
+        corrections.removeAll { $0.isCancelled }
+        corrections.append(Task { [weak self] in
+            do {
+                let fixed = try await client.correct(segments.map(\.text), speaker: speaker,
+                                                     context: context, language: language)
+                var changed: [UUID: String] = [:]
+                for (seg, text) in zip(segments, fixed) where text != seg.text { changed[seg.id] = text }
+                if !changed.isEmpty { self?.onCorrected?(changed) }
+            } catch {
+                Log.info("transcript correction failed: \(error.localizedDescription)")
+            }
+        })
     }
 
     nonisolated static func rms(_ pcm: Data) -> Float {

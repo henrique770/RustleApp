@@ -117,15 +117,37 @@ final class SystemAudioCapture {
 final class PCM16Converter {
     static let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private let converter: AVAudioConverter?
+    /// Voice-processed mic input arrives as 3+ identical channels with no channel layout, which
+    /// AVAudioConverter downmixes to silence; for those, channel 0 is copied into a mono buffer first.
+    private let mono: AVAudioFormat?
 
     init(from format: AVAudioFormat) {
-        converter = AVAudioConverter(from: format, to: Self.target)
+        if format.channelCount > 2, format.commonFormat == .pcmFormatFloat32 {
+            mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: format.sampleRate, channels: 1, interleaved: false)
+            converter = mono.flatMap { AVAudioConverter(from: $0, to: Self.target) }
+        } else {
+            mono = nil
+            converter = AVAudioConverter(from: format, to: Self.target)
+        }
     }
+
+    var isValid: Bool { converter != nil }
 
     func convert(_ buffer: AVAudioPCMBuffer) -> Data? {
         guard let converter, buffer.frameLength > 0 else { return nil }
-        let ratio = Self.target.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+        var source = buffer
+        if let mono {
+            guard let src = buffer.floatChannelData,
+                  let m = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: buffer.frameLength),
+                  let dst = m.floatChannelData else { return nil }
+            m.frameLength = buffer.frameLength
+            // Deinterleaved: channel 0 is contiguous. Interleaved: take every Nth sample.
+            let stride = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
+            for i in 0..<Int(buffer.frameLength) { dst[0][i] = src[0][i * stride] }
+            source = m
+        }
+        let ratio = Self.target.sampleRate / source.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(source.frameLength) * ratio) + 32
         guard let out = AVAudioPCMBuffer(pcmFormat: Self.target, frameCapacity: capacity) else { return nil }
         var consumed = false
         var error: NSError?
@@ -133,7 +155,7 @@ final class PCM16Converter {
             if consumed { status.pointee = .noDataNow; return nil }
             consumed = true
             status.pointee = .haveData
-            return buffer
+            return source
         }
         guard error == nil, out.frameLength > 0, let ch = out.int16ChannelData else { return nil }
         return Data(bytes: ch[0], count: Int(out.frameLength) * 2)

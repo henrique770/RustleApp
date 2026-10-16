@@ -4,7 +4,7 @@ Wispr asks its servers for suggestion pills (POST /api/v1/transform/suggestions 
 3 s timeout) and applies a pill or a typed request through its instruct pipeline with a single
 allowed tool, "rewrite", which returns the new document text. Both run server-side, so the
 prompts and model are hidden. Here:
-  1. Claude (when an API key is configured): suggestions fitted to the note, and any rewrite.
+  1. Claude or DeepSeek (when an API key is configured): suggestions fitted to the note, and any rewrite.
   2. Local fallback (offline): a fixed set of pills and rule-based rewrites for them.
 """
 
@@ -121,47 +121,40 @@ def local_rewrite(kind: str, content: str) -> Optional[str]:
 
 class Transformer:
     def __init__(self, writer: NotesWriter) -> None:
-        # Shares the Anthropic client and error handling with the meeting notes.
+        # Shares the LLM provider choice, clients and error handling with the meeting notes.
         self.writer = writer
 
     def suggestions(self, content: str, count: int) -> dict:
         count = max(1, min(count, 8))
-        if self.writer.claude_available and len(content.strip()) >= 12:
-            text = self.writer._call(
-                max_tokens=1500,
-                system=SUGGEST_SYSTEM,
-                messages=[{"role": "user", "content": f"<count>{count}</count>\n<note>\n{content[:6000]}\n</note>"}],
-                output_config={"effort": "low", "format": {"type": "json_schema", "schema": SUGGEST_SCHEMA}},
-                timeout=20,
+        provider = self.writer.provider
+        if provider and len(content.strip()) >= 12:
+            text = self.writer.complete(
+                SUGGEST_SYSTEM, f"<count>{count}</count>\n<note>\n{content[:6000]}\n</note>",
+                max_tokens=1500, timeout=20, schema=SUGGEST_SCHEMA, provider=provider,
             )
             try:
                 items = json.loads(text)["suggestions"] if text else []
             except (json.JSONDecodeError, KeyError, TypeError):
                 items = []
-            items = [i for i in items if i.get("label") and i.get("prompt")][:count]
+            items = [i for i in items if isinstance(i, dict) and i.get("label") and i.get("prompt")][:count]
             if items:
                 return {"suggestions": [{"id": f"c{n}", "label": i["label"], "prompt": i["prompt"]}
-                                        for n, i in enumerate(items)], "engine": "claude"}
+                                        for n, i in enumerate(items)], "engine": provider}
         return {"suggestions": [{"id": i, "label": l, "prompt": p} for i, l, p in LOCAL_SUGGESTIONS[:count]],
                 "engine": "local"}
 
     def apply(self, content: str, prompt: str, suggestion_id: Optional[str], selection: Optional[str]) -> dict:
         target = selection if selection else content
-        if self.writer.claude_available:
+        provider = self.writer.provider
+        if provider:
             user = f"<request>{prompt}</request>\n"
             if selection:
                 user += f"<note>\n{content}\n</note>\n<selection>\n{selection}\n</selection>"
             else:
                 user += f"<note>\n{content}\n</note>"
-            text = self.writer._call(
-                max_tokens=8000,
-                system=REWRITE_SYSTEM,
-                messages=[{"role": "user", "content": user}],
-                output_config={"effort": "low"},
-                timeout=90,
-            )
+            text = self.writer.complete(REWRITE_SYSTEM, user, max_tokens=8000, timeout=90, provider=provider)
             if text:
-                return {"text": text, "engine": "claude"}
+                return {"text": text, "engine": provider}
         kind = suggestion_id if suggestion_id in {i for i, _, _ in LOCAL_SUGGESTIONS} else None
         if kind is None:
             # Typed requests need a model; match the prompt to a local pill when possible.
@@ -172,5 +165,5 @@ class Transformer:
         result = local_rewrite(kind, target) if kind else None
         if result is None:
             return {"text": None, "engine": "local",
-                    "error": "Pedidos livres precisam do Claude: adicione a chave em Configurações → Polimento com IA."}
+                    "error": "Pedidos livres precisam de IA: adicione a chave do Claude ou do DeepSeek em Configurações → Polimento com IA."}
         return {"text": result, "engine": "local"}

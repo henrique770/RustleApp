@@ -93,7 +93,10 @@ final class AppModel: ObservableObject {
         var dictionary: [String] = ["RustleApp"]
         var replacements: [String: String] = [:]
         var snippets: [String: String] = [:]
+        /// The "polish with AI" toggle (key name kept for compatibility with older settings files).
         var use_claude: Bool = false
+        /// Preferred LLM: "claude" or "deepseek". The server uses the other one when this one has no key.
+        var ai_provider: String = "claude"
         /// Tone per app category, like Wispr's Style page: personal / work / email / other
         /// -> formal | casual | very_casual | excited.
         var styles: [String: String] = ["personal": "casual", "work": "formal", "email": "formal", "other": "formal"]
@@ -107,6 +110,7 @@ final class AppModel: ObservableObject {
             replacements = try c.decodeIfPresent([String: String].self, forKey: .replacements) ?? d.replacements
             snippets = try c.decodeIfPresent([String: String].self, forKey: .snippets) ?? d.snippets
             use_claude = try c.decodeIfPresent(Bool.self, forKey: .use_claude) ?? d.use_claude
+            ai_provider = try c.decodeIfPresent(String.self, forKey: .ai_provider) ?? d.ai_provider
             styles = d.styles.merging(try c.decodeIfPresent([String: String].self, forKey: .styles) ?? [:]) { $1 }
         }
     }
@@ -247,28 +251,57 @@ final class AppModel: ObservableObject {
     }
 
     /// Adds transcribed segments. Without headphones the mic also hears the other people, so a
-    /// "Você" line that repeats an overlapping "Outros" line is dropped as echo.
+    /// "Você" line that repeats what "Outros" said around the same time is dropped as echo.
+    /// Re-checked on every update because the two streams are transcribed out of order.
     func appendSegments(_ new: [Meeting.Segment], to id: UUID) {
         updateMeeting(id) { m in
-            for seg in new {
-                if seg.speaker == .you,
-                   m.segments.contains(where: { $0.speaker == .them && Self.isEcho(seg, of: $0) }) { continue }
-                if seg.speaker == .them {
-                    m.segments.removeAll { $0.speaker == .you && Self.isEcho($0, of: seg) }
-                }
-                m.segments.append(seg)
-            }
+            m.segments.append(contentsOf: new)
+            let system = m.segments.filter { $0.speaker == .them }
+            m.segments.removeAll { $0.speaker == .you && Self.isEcho($0, of: system) }
         }
     }
 
-    private static func isEcho(_ mic: Meeting.Segment, of system: Meeting.Segment) -> Bool {
-        guard mic.start < system.end + 4, mic.end > system.start - 4 else { return false }
-        func words(_ s: String) -> Set<String> {
-            Set(s.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count > 2 })
+    /// Replaces segment text with the AI-corrected version, then re-runs the echo check
+    /// (corrected text matches the other stream more reliably).
+    func correctSegments(_ texts: [UUID: String], in id: UUID) {
+        updateMeeting(id) { m in
+            for i in m.segments.indices { if let t = texts[m.segments[i].id] { m.segments[i].text = t } }
+            let system = m.segments.filter { $0.speaker == .them }
+            m.segments.removeAll { $0.speaker == .you && Self.isEcho($0, of: system) }
         }
-        let a = words(mic.text), b = words(system.text)
+    }
+
+    /// True when most of the mic line's words were also said on the system audio within ±4 s.
+    /// Words match fuzzily: Whisper hears the bleed slightly differently ("deixa"/"deixo", "anda"/"manda").
+    static func isEcho(_ mic: Meeting.Segment, of system: [Meeting.Segment]) -> Bool {
+        let nearby = system.filter { mic.start < $0.end + 4 && mic.end > $0.start - 4 }
+        guard !nearby.isEmpty else { return false }
+        func words(_ s: String) -> [String] {
+            s.lowercased().folding(options: .diacriticInsensitive, locale: nil)
+                .split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count > 2 }
+        }
+        let a = Set(words(mic.text))
+        let b = Set(nearby.flatMap { words($0.text) })
         guard !a.isEmpty, !b.isEmpty else { return false }
-        return Double(a.intersection(b).count) / Double(min(a.count, b.count)) >= 0.6
+        let matched = a.filter { w in b.contains(w) || b.contains { similar(w, $0) } }.count
+        return Double(matched) / Double(a.count) >= 0.6
+    }
+
+    /// Edit-distance similarity ≥ 0.7 for words of 4+ letters ("ponta"/"ponto", "bale"/"bala").
+    private static func similar(_ x: String, _ y: String) -> Bool {
+        let a = Array(x), b = Array(y)
+        guard min(a.count, b.count) >= 4, abs(a.count - b.count) <= 3 else { return false }
+        var row = Array(0...b.count)
+        for i in 1...a.count {
+            var prev = row[0]
+            row[0] = i
+            for j in 1...b.count {
+                let cur = row[j]
+                row[j] = a[i - 1] == b[j - 1] ? prev : min(prev, row[j], row[j - 1]) + 1
+                prev = cur
+            }
+        }
+        return 1 - Double(row[b.count]) / Double(max(a.count, b.count)) >= 0.7
     }
 
     var totalWords: Int { history.reduce(0) { $0 + $1.words } }
@@ -334,7 +367,9 @@ final class MeetingLevels: ObservableObject {
 enum Prefs {
     static let hotkey = "hotkey"            // fn | right_option | right_command
     static let language = "language"        // pt | en | auto
-    static let whisperModel = "whisperModel" // base | small | medium
+    static let whisperModel = "whisperModel" // base | small | medium | large-v3-turbo
+    /// Notetaker model; can be bigger than the dictation one since meetings aren't latency-bound.
+    static let meetingWhisperModel = "meetingWhisperModel"
     static let scratchpadOpenBehavior = "scratchpadOpenBehavior" // resume | new_tab | last_pinned
     static let scratchpadLastNote = "scratchpadLastNote"
     static let onboardingDone = "onboardingDone"

@@ -15,7 +15,7 @@ final class ServerManager {
         self.settingsPath = settingsPath
     }
 
-    static let requiredAPIVersion = 5
+    static let requiredAPIVersion = 8
 
     private func health() async -> [String: Any]? {
         var req = URLRequest(url: baseURL.appendingPathComponent("health"))
@@ -92,9 +92,14 @@ final class ServerManager {
         // A multilingual model by default (Portuguese and English); override with RUSTLE_WHISPER_MODEL.
         env["RUSTLE_WHISPER_MODEL"] = env["RUSTLE_WHISPER_MODEL"]
             ?? UserDefaults.standard.string(forKey: "whisperModel") ?? "small"
+        env["RUSTLE_MEETING_WHISPER_MODEL"] = env["RUSTLE_MEETING_WHISPER_MODEL"]
+            ?? UserDefaults.standard.string(forKey: Prefs.meetingWhisperModel) ?? "large-v3-turbo"
         env["RUSTLE_SETTINGS"] = settingsPath
         if let key = Keychain.readAPIKey(), env["ANTHROPIC_API_KEY"] == nil {
             env["ANTHROPIC_API_KEY"] = key
+        }
+        if let key = Keychain.readAPIKey(Keychain.deepseek), env["DEEPSEEK_API_KEY"] == nil {
+            env["DEEPSEEK_API_KEY"] = key
         }
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         p.environment = env

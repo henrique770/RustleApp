@@ -5,6 +5,7 @@ but runs on your machine with an open-source Whisper model.
 
     POST /v1/dictate     {"audio_wav_b64": "...", "context": {...}}  ->  {"raw", "text", "formatter", "latency_ms"}
     POST /v1/transcribe  {"audio_wav_b64": "...", "language"}        ->  {"segments": [{"start", "end", "text"}]}
+    POST /v1/correct     {"lines", "speaker", "context", "language"}  ->  {"lines", "engine"}
     POST /v1/notes       {"transcript": [...], "user_notes", ...}     ->  {"title", "summary", "action_items", "engine"}
     POST /v1/notes/ask   {"question", "transcript", ...}              ->  {"answer", "engine"}
     POST /v1/transform/suggestions {"content", "count"}               ->  {"suggestions": [{"id", "label", "prompt"}]}
@@ -18,6 +19,8 @@ import base64
 import io
 import logging
 import os
+import re
+import threading
 import time
 import wave
 from typing import Optional
@@ -36,11 +39,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 WHISPER_MODEL = os.environ.get("RUSTLE_WHISPER_MODEL", "base.en")
 WHISPER_DEVICE = os.environ.get("RUSTLE_WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.environ.get("RUSTLE_WHISPER_COMPUTE", "int8")
+# Meetings can afford a bigger model than dictation (chunks run in the background, not while the
+# user waits for a paste); large-v3-turbo gets far fewer invented words on Portuguese call audio.
+# Empty or equal to WHISPER_MODEL means one model for both.
+MEETING_MODEL = os.environ.get("RUSTLE_MEETING_WHISPER_MODEL", "large-v3-turbo")
 # Default language, e.g. "pt" or "en"; empty means auto-detect. A request can override it.
 WHISPER_LANGUAGE = os.environ.get("RUSTLE_LANGUAGE") or None
 MAX_AUDIO_SECONDS = 600
 # Bumped when the app/server contract changes; the desktop app restarts older servers.
-API_VERSION = 5
+API_VERSION = 8
 
 
 class Context(BaseModel):
@@ -69,6 +76,13 @@ class TranscribeRequest(BaseModel):
     language: Optional[str] = None
 
 
+class CorrectRequest(BaseModel):
+    lines: list[str]
+    speaker: str = ""
+    context: str = ""
+    language: Optional[str] = None
+
+
 class Segment(BaseModel):
     start: float
     end: float
@@ -86,6 +100,8 @@ class NotesRequest(BaseModel):
     user_notes: str = ""
     title: str = ""
     language: Optional[str] = None
+    # Names the user set for each side, e.g. {"Você": "Henrique", "Outros": "Ana"}.
+    participants: dict[str, str] = {}
 
 
 class SummarySection(BaseModel):
@@ -102,6 +118,7 @@ class NotesResponse(BaseModel):
     title: str
     summary: list[SummarySection]
     action_items: list[ActionItem]
+    other_speaker_name: str = ""
     engine: str
 
 
@@ -124,12 +141,21 @@ class TransformRequest(BaseModel):
     selection: Optional[str] = None
 
 
+# Stock phrases Whisper produces from silence (YouTube subtitle credits in its training data).
+HALLUCINATIONS = re.compile(
+    r"legendas? (pela|por)|amara\.org|inscreva-se no canal|obrigado por assistir|"
+    r"subtitles by|thanks for watching|transcrição (por|automática)",
+    re.IGNORECASE,
+)
+
+
 class Transcriber:
-    def __init__(self) -> None:
+    def __init__(self, name: str = WHISPER_MODEL) -> None:
         from faster_whisper import WhisperModel
 
-        log.info("Loading Whisper model %s (%s/%s)", WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE)
-        self.model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+        self.name = name
+        log.info("Loading Whisper model %s (%s/%s)", name, WHISPER_DEVICE, WHISPER_COMPUTE)
+        self.model = WhisperModel(name, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
 
     def transcribe(self, audio: np.ndarray, vocabulary: list[str], language: Optional[str]) -> str:
         # Personal dictionary words bias recognition, like Wispr's StaticVocabulary.
@@ -137,7 +163,7 @@ class Transcriber:
         segments, _ = self.model.transcribe(
             audio,
             beam_size=5,
-            language=None if WHISPER_MODEL.endswith(".en") else language,
+            language=None if self.name.endswith(".en") else language,
             vad_filter=True,
             initial_prompt=prompt,
             condition_on_previous_text=False,
@@ -150,12 +176,28 @@ class Transcriber:
         segments, _ = self.model.transcribe(
             audio,
             beam_size=5,
-            language=None if WHISPER_MODEL.endswith(".en") else language,
+            language=None if self.name.endswith(".en") else language,
             vad_filter=True,
             initial_prompt=prompt,
             condition_on_previous_text=False,
         )
-        return [Segment(start=s.start, end=s.end, text=s.text.strip()) for s in segments if s.text.strip()]
+        out = []
+        for s in segments:
+            text = s.text.strip()
+            if not text:
+                continue
+            # Whisper hallucinates short phrases on noise or faint bleed ("Legendas pela comunidade…",
+            # "Então, relaxa."). Its own confidence flags them: likely non-speech decoded with low
+            # confidence, or looping text.
+            if (s.no_speech_prob > 0.6 and s.avg_logprob < -0.7) or s.avg_logprob < -1.2 or s.compression_ratio > 2.4:
+                log.info("dropped low-confidence segment (no_speech=%.2f logprob=%.2f ratio=%.2f): %r",
+                         s.no_speech_prob, s.avg_logprob, s.compression_ratio, text)
+                continue
+            if HALLUCINATIONS.search(text):
+                log.info("dropped known hallucination: %r", text)
+                continue
+            out.append(Segment(start=s.start, end=s.end, text=text))
+        return out
 
 
 def decode_wav(data: bytes) -> np.ndarray:
@@ -172,22 +214,41 @@ def decode_wav(data: bytes) -> np.ndarray:
 
 
 app = FastAPI(title="rustle-server")
-formatter = Formatter(SettingsStore())
-notes_writer = NotesWriter()
+settings_store = SettingsStore()
+formatter = Formatter(settings_store)
+notes_writer = NotesWriter(settings_store)
 transformer = Transformer(notes_writer)
 transcriber: Optional[Transcriber] = None
+meeting_transcriber: Optional[Transcriber] = None
+# faster-whisper models are not safe to call from several threads at once.
+meeting_lock = threading.Lock()
 
 
 @app.on_event("startup")
 def _load() -> None:
     global transcriber
     transcriber = Transcriber()
+    if MEETING_MODEL and MEETING_MODEL != WHISPER_MODEL:
+        # Loads (and downloads, the first time) in the background; meetings use the dictation
+        # model until it is ready, so nothing waits on it.
+        threading.Thread(target=_load_meeting_model, daemon=True).start()
+
+
+def _load_meeting_model() -> None:
+    global meeting_transcriber
+    try:
+        meeting_transcriber = Transcriber(MEETING_MODEL)
+        log.info("meeting model %s ready", MEETING_MODEL)
+    except Exception as e:  # noqa: BLE001 - a bad name or failed download must not kill the server
+        log.warning("meeting model %s unavailable (%s); meetings use %s", MEETING_MODEL, e, WHISPER_MODEL)
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": transcriber is not None, "api_version": API_VERSION, "model": WHISPER_MODEL, "language": WHISPER_LANGUAGE or "auto",
-            "llm": formatter.llm_enabled, "notes_llm": notes_writer.claude_available}
+    return {"ok": transcriber is not None, "api_version": API_VERSION, "model": WHISPER_MODEL,
+            "meeting_model": meeting_transcriber.name if meeting_transcriber else WHISPER_MODEL, "language": WHISPER_LANGUAGE or "auto",
+            "llm": formatter.llm_enabled, "notes_llm": notes_writer.llm_available,
+            "llm_provider": formatter.provider or notes_writer.provider}
 
 
 @app.post("/v1/dictate", response_model=DictateResponse)
@@ -227,16 +288,30 @@ def transcribe(req: TranscribeRequest) -> dict:
         audio = decode_wav(base64.b64decode(req.audio_wav_b64, validate=True))
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    segments = transcriber.segments(audio, formatter.settings.dictionary, _language(req.language))
+    model = meeting_transcriber or transcriber
+    with meeting_lock:
+        segments = model.segments(audio, formatter.settings.dictionary, _language(req.language))
     latency = int((time.perf_counter() - started) * 1000)
-    log.info("meeting chunk %.1fs -> %d segments %dms", len(audio) / 16000, len(segments), latency)
+    log.info("meeting chunk %.1fs -> %d segments via %s %dms", len(audio) / 16000, len(segments), model.name, latency)
     return {"segments": [s.model_dump() for s in segments], "latency_ms": latency}
+
+
+@app.post("/v1/correct")
+def correct(req: CorrectRequest) -> dict:
+    """LLM proofreading of a transcribed meeting chunk (misheard words, punctuation)."""
+    started = time.perf_counter()
+    result = notes_writer.correct(req.lines, req.speaker, req.context, formatter.settings.dictionary,
+                                  _language(req.language))
+    log.info("correct %d lines via %s in %dms", len(req.lines), result["engine"],
+             int((time.perf_counter() - started) * 1000))
+    return result
 
 
 @app.post("/v1/notes", response_model=NotesResponse)
 def notes(req: NotesRequest) -> dict:
     started = time.perf_counter()
-    result = notes_writer.notes([t.model_dump() for t in req.transcript], req.user_notes, req.title, req.language)
+    result = notes_writer.notes([t.model_dump() for t in req.transcript], req.user_notes, req.title, req.language,
+                                 req.participants)
     log.info("notes for %d lines via %s in %dms", len(req.transcript), result.get("engine"),
              int((time.perf_counter() - started) * 1000))
     return result

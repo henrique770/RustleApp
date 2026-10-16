@@ -2,8 +2,8 @@
 
 Two tiers:
   1. Rules (always on, offline): filler removal, snippets, replacements, capitalization, punctuation.
-  2. Claude polish (optional: "use_claude" in settings or RUSTLE_LLM=claude): app-aware rewrite
-     using the focused-app context.
+  2. AI polish (optional: "use_claude" in settings or RUSTLE_LLM=claude|deepseek): app-aware rewrite
+     using the focused-app context, by Claude or DeepSeek ("ai_provider" in settings).
      Any failure, timeout, or refusal falls back to the rules output, so dictation never blocks.
 """
 
@@ -16,10 +16,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from llm import CLAUDE_MODEL, PROVIDERS, deepseek_complete, pick_provider
+
 log = logging.getLogger("rustle.formatter")
 
 SETTINGS_PATH = Path(os.environ.get("RUSTLE_SETTINGS", Path(__file__).with_name("rustle.json")))
-CLAUDE_MODEL = os.environ.get("RUSTLE_CLAUDE_MODEL", "claude-opus-5-5")
 
 # English and Portuguese fillers. "tipo"/"né" only when set off by commas, since they are also real words.
 FILLERS = re.compile(
@@ -33,6 +34,8 @@ SYSTEM_PROMPT = """You clean up dictated speech before it is typed into the user
 Return only the final text to insert, with no preamble, quotes, or commentary.
 - Remove filler words, false starts, and repeated words.
 - When the speaker corrects themselves ("at 3, no wait, 4"), keep only the correction.
+- Fix words the speech recognizer clearly misheard (nonsense words, wrong homophones, broken
+  names or technical terms), using the context and vocabulary; when unsure, keep the word.
 - Fix punctuation and capitalization. Keep the speaker's words and meaning; do not add content.
 - Keep the language the speaker used (for example Portuguese stays Portuguese); never translate.
 - Spoken list structure ("first..., second...") may become a short list when it reads better.
@@ -74,7 +77,9 @@ class Settings:
     dictionary: list[str] = field(default_factory=list)
     replacements: dict[str, str] = field(default_factory=dict)
     snippets: dict[str, str] = field(default_factory=dict)
+    # The "polish with AI" toggle (name kept for settings-file compatibility).
     use_claude: bool = False
+    ai_provider: str = "claude"
     styles: dict[str, str] = field(default_factory=lambda: {
         "personal": "casual", "work": "formal", "email": "formal", "other": "formal"})
 
@@ -91,9 +96,17 @@ def load_settings(path: Path = SETTINGS_PATH) -> Settings:
         dictionary=list(data.get("dictionary", [])),
         replacements=dict(data.get("replacements", {})),
         snippets=dict(data.get("snippets", {})),
-        use_claude=bool(data.get("use_claude", False)) or os.environ.get("RUSTLE_LLM", "").lower() == "claude",
+        use_claude=bool(data.get("use_claude", False)) or os.environ.get("RUSTLE_LLM", "").lower() in PROVIDERS,
+        ai_provider=_provider(data.get("ai_provider")),
         styles={**Settings().styles, **dict(data.get("styles", {}))},
     )
+
+
+def _provider(value) -> str:
+    env = os.environ.get("RUSTLE_LLM", "").lower()
+    if value in PROVIDERS:
+        return value
+    return env if env in PROVIDERS else "claude"
 
 
 class SettingsStore:
@@ -133,9 +146,15 @@ class Formatter:
         return self.settings.use_claude
 
     @property
-    def client(self):
+    def provider(self) -> str | None:
+        """Which LLM polishes dictation, or None when the toggle is off."""
         if not self.settings.use_claude:
             return None
+        # Claude can also authenticate without the env var (e.g. a profile), so it stays the default.
+        return pick_provider(self.settings.ai_provider) or "claude"
+
+    @property
+    def client(self):
         if self._client is None:
             import anthropic
 
@@ -154,10 +173,11 @@ class Formatter:
                 return expansion, "snippet"
 
         text, used = self._rules(raw, context), "rules"
-        if self.client is not None:
-            polished = self._claude(raw, context)
+        provider = self.provider
+        if provider is not None:
+            polished = self._deepseek(raw, context) if provider == "deepseek" else self._claude(raw, context)
             if polished:
-                text, used = self._apply_replacements(polished), "claude"
+                text, used = self._apply_replacements(polished), provider
         return self._space_after(text, context), used
 
     @staticmethod
@@ -193,9 +213,7 @@ class Formatter:
             text = re.sub(rf"\b{re.escape(spoken)}\b", written, text, flags=re.IGNORECASE)
         return text
 
-    def _claude(self, raw: str, context: dict) -> str | None:
-        import anthropic
-
+    def _prompt(self, raw: str, context: dict) -> str:
         bundle = context.get("bundleId") or ""
         kind = "chat" if bundle in CHAT_APPS else "code" if bundle in CODE_APPS else "general"
         details = {
@@ -206,10 +224,20 @@ class Formatter:
             "selected_text": context.get("selectedText") or "",
             "vocabulary": self.settings.dictionary[:100],
         }
-        user = (
+        return (
             f"<context>{json.dumps(details, ensure_ascii=False)}</context>\n"
             f"<dictation>{raw}</dictation>"
         )
+
+    def _deepseek(self, raw: str, context: dict) -> str | None:
+        # Same 8 s budget as Claude: a slow polish is worse than an unpolished paste.
+        return deepseek_complete(SYSTEM_PROMPT, self._prompt(raw, context), max_tokens=2048, timeout=8.0,
+                                 label="DeepSeek polish")
+
+    def _claude(self, raw: str, context: dict) -> str | None:
+        import anthropic
+
+        user = self._prompt(raw, context)
         try:
             response = self.client.beta.messages.create(
                 model=CLAUDE_MODEL,

@@ -51,6 +51,23 @@ struct Meeting: Codable, Identifiable, Hashable {
     var chat: [ChatMessage] = []
     /// App the meeting was detected in (Zoom, Teams, Meet…), when known.
     var appName: String?
+    /// Display names per side ("you" / "them"), set by the user or accepted from a suggestion.
+    var speakerNames: [String: String]?
+    /// Who the AI thinks is on the "Outros" side, offered for one-click confirmation.
+    var suggestedOtherName: String?
+
+    /// The user's name (or "Você") and the other side's name (or "Outros").
+    func name(of speaker: Speaker) -> String {
+        let n = speakerNames?[speaker.rawValue]?.trimmingCharacters(in: .whitespaces) ?? ""
+        return n.isEmpty ? speaker.label : n
+    }
+
+    mutating func setName(_ name: String, for speaker: Speaker) {
+        var names = speakerNames ?? [:]
+        names[speaker.rawValue] = name.trimmingCharacters(in: .whitespaces)
+        speakerNames = names
+        if speaker == .them { suggestedOtherName = nil }
+    }
 
     var displayTitle: String {
         if !title.trimmingCharacters(in: .whitespaces).isEmpty { return title }
@@ -67,7 +84,7 @@ struct Meeting: Codable, Identifiable, Hashable {
     var orderedSegments: [Segment] { segments.sorted { $0.start < $1.start } }
 
     var transcriptText: String {
-        orderedSegments.map { "\($0.speaker.label): \($0.text)" }.joined(separator: "\n")
+        orderedSegments.map { "\(name(of: $0.speaker)): \($0.text)" }.joined(separator: "\n")
     }
 }
 
@@ -82,6 +99,7 @@ struct NotetakerClient {
         let title: String
         let summary: [Meeting.SummarySection]
         let action_items: [Item]
+        let other_speaker_name: String?
         let engine: String
     }
 
@@ -92,10 +110,25 @@ struct NotetakerClient {
         return res.segments.map { ($0.start, $0.end, $0.text) }
     }
 
+    /// LLM proofreading of one chunk's lines; returns them unchanged when no AI key is configured.
+    func correct(_ lines: [String], speaker: Meeting.Speaker, context: String, language: String) async throws -> [String] {
+        struct Req: Encodable { let lines: [String]; let speaker: String; let context: String; let language: String }
+        struct Res: Decodable { let lines: [String] }
+        let res: Res = try await post("v1/correct", Req(lines: lines, speaker: speaker.label, context: context,
+                                                        language: language), timeout: 60)
+        return res.lines.count == lines.count ? res.lines : lines
+    }
+
     func notes(for meeting: Meeting, language: String) async throws -> NotesResult {
-        struct Req: Encodable { let transcript: [Line]; let user_notes: String; let title: String; let language: String }
+        struct Req: Encodable {
+            let transcript: [Line]; let user_notes: String; let title: String; let language: String
+            let participants: [String: String]
+        }
+        var participants: [String: String] = [:]
+        for s in [Meeting.Speaker.you, .them] where meeting.name(of: s) != s.label { participants[s.label] = meeting.name(of: s) }
         return try await post("v1/notes", Req(transcript: lines(meeting), user_notes: meeting.userNotes,
-                                              title: meeting.title, language: language), timeout: 240)
+                                              title: meeting.title, language: language,
+                                              participants: participants), timeout: 240)
     }
 
     func ask(_ question: String, about meeting: Meeting) async throws -> String {

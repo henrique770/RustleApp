@@ -426,15 +426,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func startMeeting(app: String?) -> UUID? {
         if let active = model.activeMeetingID { return active }
-        let meeting = Meeting(appName: app)
+        var meeting = Meeting(appName: app)
+        if !model.displayFirstName.isEmpty { meeting.setName(model.displayFirstName, for: .you) }
         model.meetings.insert(meeting, at: 0)
         let id = meeting.id
         meetingRecorder.onSegments = { [weak self] segments in self?.model.appendSegments(segments, to: id) }
+        meetingRecorder.onCorrected = { [weak self] texts in self?.model.correctSegments(texts, in: id) }
+        meetingRecorder.recentTranscript = { [weak self] in
+            guard let m = self?.model.meeting(id) else { return "" }
+            return m.orderedSegments.suffix(12).map { "\(m.name(of: $0.speaker)): \($0.text)" }.joined(separator: "\n")
+        }
         meetingRecorder.onLevels = { [weak self] mic, system in self?.model.meetingLevels.push(mic: mic, system: system) }
         do {
             try meetingRecorder.start(language: Config.language)
         } catch {
             model.meetings.removeAll { $0.id == id }
+            Log.info("meeting recording failed to start: \(error)")
             overlay.show(.message("Notetaker: \(error.localizedDescription)", isError: true), autoHideAfter: 6)
             return nil
         }
@@ -492,6 +499,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     m.actionItems = kept + notes.action_items.map { Meeting.ActionItem(text: $0.text, owner: $0.owner) }
                     m.summaryEngine = notes.engine
                     if m.title.trimmingCharacters(in: .whitespaces).isEmpty, !notes.title.isEmpty { m.title = notes.title }
+                    if let other = notes.other_speaker_name?.trimmingCharacters(in: .whitespaces), !other.isEmpty,
+                       m.name(of: .them) == Meeting.Speaker.them.label {
+                        m.suggestedOtherName = other
+                    }
                 }
                 Log.info("meeting notes via \(notes.engine): \(notes.summary.count) sections, \(notes.action_items.count) actions")
             } catch {

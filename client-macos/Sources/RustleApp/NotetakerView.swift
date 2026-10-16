@@ -265,12 +265,18 @@ private struct NotetakerEmpty: View {
 
 // MARK: - Meeting page
 
-private enum MeetingSection: String, CaseIterable { case notes, summary, actions
+private enum MeetingSection: String, CaseIterable { case notes, summary, transcript, actions
     var title: String {
-        switch self { case .notes: return "Minhas notas"; case .summary: return "Resumo"; case .actions: return "Itens de ação" }
+        switch self {
+        case .notes: return "Minhas notas"; case .summary: return "Resumo"
+        case .transcript: return "Transcrição"; case .actions: return "Itens de ação"
+        }
     }
     var icon: String {
-        switch self { case .notes: return "pencil.line"; case .summary: return "sparkles"; case .actions: return "checklist" }
+        switch self {
+        case .notes: return "pencil.line"; case .summary: return "sparkles"
+        case .transcript: return "text.bubble"; case .actions: return "checklist"
+        }
     }
 }
 
@@ -294,6 +300,7 @@ private struct MeetingPage: View {
                             header(proxy: proxy)
                             NotepadSection(model: model, id: id).id(MeetingSection.notes)
                             SummarySection(model: model, id: id, isLive: isLive).id(MeetingSection.summary)
+                            TranscriptSection(model: model, id: id, meeting: meeting, isLive: isLive).id(MeetingSection.transcript)
                             ActionItemsSection(model: model, id: id).id(MeetingSection.actions)
                         }
                         .frame(maxWidth: 720, alignment: .leading)
@@ -343,7 +350,9 @@ private struct MeetingPage: View {
 
     private var speakersLabel: String {
         let speakers = Set(meeting.segments.map(\.speaker))
-        return speakers.count == 2 ? "Você e outros" : speakers.contains(.them) ? "Outros" : "Você"
+        let you = meeting.name(of: .you), them = meeting.name(of: .them)
+        if speakers.count == 2 { return them == Meeting.Speaker.them.label ? "\(you) e outros" : "\(you) e \(them)" }
+        return speakers.contains(.them) ? them : you
     }
 }
 
@@ -532,11 +541,112 @@ private struct SummarySection: View {
                             }
                         }
                     }
-                    Text(m.summaryEngine == "claude" ? "Gerado com Claude" : "Resumo local (sem IA) · ative o Claude em Configurações para resumos completos")
+                    Text(m.summaryEngine == "claude" ? "Gerado com Claude"
+                         : m.summaryEngine == "deepseek" ? "Gerado com DeepSeek"
+                         : "Resumo local (sem IA) · adicione a chave do Claude ou do DeepSeek em Configurações para resumos completos")
                         .font(DS.ui(12)).foregroundColor(DS.foregroundTertiary)
                 }
                 .opacity(busy ? 0.5 : 1)
             }
+        }
+    }
+}
+
+/// The full transcript inline on the page, so it is visible without opening the drawer.
+/// Scrolls inside its card so a long meeting does not push the action items far down.
+private struct TranscriptSection: View {
+    @ObservedObject var model: AppModel
+    let id: UUID
+    let meeting: Meeting
+    let isLive: Bool
+    @State private var copied = false
+    @State private var renaming = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeading(title: "Transcrição", trailing: meeting.segments.isEmpty ? nil : AnyView(
+                HStack(spacing: 4) {
+                    Text("\(meeting.segments.count) falas").font(DS.ui(13)).foregroundColor(DS.foregroundTertiary)
+                    IconButton(systemName: "person.2", help: "Nomes de quem fala") { renaming = true }
+                        .popover(isPresented: $renaming, arrowEdge: .bottom) {
+                            SpeakerNamesEditor(model: model, id: id, meeting: meeting)
+                        }
+                    IconButton(systemName: copied ? "checkmark" : "doc.on.doc", help: "Copiar transcrição") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(meeting.transcriptText, forType: .string)
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+                    }
+                }))
+            if let suggestion = meeting.suggestedOtherName {
+                HStack(spacing: 10) {
+                    Image(systemName: "sparkles").foregroundColor(DS.chord600)
+                    (Text("Quem fala no áudio do computador parece ser ") + Text(suggestion).bold() + Text("."))
+                        .font(DS.ui(14))
+                    Spacer()
+                    Button("Usar") { model.updateMeeting(id) { $0.setName(suggestion, for: .them) } }
+                        .buttonStyle(PrimaryButtonStyle())
+                    Button("Editar") { renaming = true }.buttonStyle(SecondaryButtonStyle())
+                    IconButton(systemName: "xmark", help: "Dispensar") { model.updateMeeting(id) { $0.suggestedOtherName = nil } }
+                }
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(DS.card))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(DS.border, lineWidth: 1))
+            }
+            TranscriptView(meeting: meeting, isLive: isLive, query: "")
+                .frame(height: meeting.segments.count > 8 ? 460 : 220)
+                .background(RoundedRectangle(cornerRadius: 12).fill(DS.card))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(DS.border, lineWidth: 1))
+        }
+    }
+}
+
+/// Renames the two sides of the transcript: the mic (the user) and the computer audio.
+private struct SpeakerNamesEditor: View {
+    @ObservedObject var model: AppModel
+    let id: UUID
+    @State private var you: String
+    @State private var them: String
+
+    init(model: AppModel, id: UUID, meeting: Meeting) {
+        self.model = model
+        self.id = id
+        let name = { (s: Meeting.Speaker) in meeting.name(of: s) == s.label ? "" : meeting.name(of: s) }
+        _you = State(initialValue: name(.you))
+        _them = State(initialValue: name(.them).isEmpty ? (meeting.suggestedOtherName ?? "") : name(.them))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Nomes na transcrição").font(DS.ui(15, DS.w550))
+            field("Seu microfone", placeholder: "Você", text: $you)
+            field("Áudio do computador", placeholder: "Outros", text: $them)
+            Text("Com várias pessoas na chamada, todas aparecem com o nome do áudio do computador.")
+                .font(DS.ui(12)).foregroundColor(DS.foregroundTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Salvar") {
+                    model.updateMeeting(id) { m in
+                        m.setName(you, for: .you)
+                        m.setName(them, for: .them)
+                    }
+                }.buttonStyle(PrimaryButtonStyle())
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+
+    private func field(_ label: String, placeholder: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(DS.ui(12)).foregroundColor(DS.foregroundTertiary)
+            TextField("", text: text, prompt: Text(placeholder))
+                .textFieldStyle(.plain).font(DS.ui(14))
+                .padding(.horizontal, 10).frame(height: 32)
+                .background(RoundedRectangle(cornerRadius: 8).fill(DS.card))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(DS.border, lineWidth: 1))
         }
     }
 }
@@ -872,7 +982,7 @@ private struct TranscriptView: View {
                             Text(Self.clock(seg.start)).font(DS.ui(12).monospacedDigit())
                                 .foregroundColor(DS.foregroundTertiary).frame(width: 40, alignment: .leading)
                             // .speaker { display:inline; font-weight:550 }
-                            (Text(seg.speaker.label + ": ").font(DS.ui(15, DS.w550))
+                            (Text(meeting.name(of: seg.speaker) + ": ").font(DS.ui(15, DS.w550))
                                 .foregroundColor(seg.speaker == .you ? DS.chord600 : DS.foreground)
                              + Text(seg.text).font(DS.ui(15)))
                                 .lineSpacing(3)

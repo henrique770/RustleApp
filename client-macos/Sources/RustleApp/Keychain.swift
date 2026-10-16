@@ -1,12 +1,13 @@
 import Foundation
 import Security
 
-/// Stores the optional Anthropic API key in the login keychain (never in a plain file).
+/// Stores the optional LLM API keys (Anthropic, DeepSeek) in the login keychain (never in a plain file).
 enum Keychain {
     private static let service = "dev.rustleapp.client"
-    private static let account = "anthropic_api_key"
+    static let anthropic = "anthropic_api_key"
+    static let deepseek = "deepseek_api_key"
 
-    static func readAPIKey() -> String? {
+    static func readAPIKey(_ account: String = anthropic) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -21,7 +22,7 @@ enum Keychain {
     }
 
     @discardableResult
-    static func saveAPIKey(_ key: String) -> Bool {
+    static func saveAPIKey(_ key: String, account: String = anthropic) -> Bool {
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
