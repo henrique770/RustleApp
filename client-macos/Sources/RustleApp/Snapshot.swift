@@ -69,6 +69,20 @@ enum Snapshot {
                to: dir.appendingPathComponent("scratchpad-formatting.png"))
         sp.versionMenuOpen = false
         sp.bottomBar = .none
+        // Markdown rendered in the editor (not focused, so no line shows its syntax).
+        let md = AppModel.Note(body: "# Pendências da semana\nTexto com **negrito**, _itálico_, *também itálico*, `código` e ~~riscado~~.\n\n## Tarefas\n- [ ] Revisar o contrato com o **jurídico**\n- [x] Enviar a proposta\n- [ ] Ler [a documentação](https://example.com/docs) antes de sexta\n\n## Notas\n- Item de lista comum\n  - Item aninhado com um texto longo o bastante para quebrar a linha e mostrar o recuo\n1. Primeiro passo\n2. Segundo passo\n> Citação: o foco é velocidade.\n\n---\nLink solto: https://rustle.app/beta.")
+        model.notes.insert(md, at: 0)
+        sp.open(note: md.id)
+        render(ScratchpadView(controller: sp, model: model), size: NSSize(width: 720, height: 680),
+               to: dir.appendingPathComponent("scratchpad-markdown.png"))
+        sp.close(tab: sp.tabs.first { $0.noteID == md.id }!.id)
+        // The same note on the hub's Notes page, with only sample notes in the list.
+        let allNotes = model.notes
+        UserDefaults.standard.register(defaults: [Prefs.onboardingDone: true])   // in memory only: skip the questionnaire
+        model.notes = [md, note]
+        render(MainView(model: model, initialPage: .notes), size: NSSize(width: 1100, height: 720),
+               to: dir.appendingPathComponent("hub-notes-markdown.png"))
+        model.notes = allNotes
         sp.activate(sp.tabs[1].id)
         render(ScratchpadView(controller: sp, model: model), size: ScratchpadController.defaultSize,
                to: dir.appendingPathComponent("scratchpad-empty.png"))

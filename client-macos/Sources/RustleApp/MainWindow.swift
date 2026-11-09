@@ -851,12 +851,10 @@ private struct NotesPage: View {
                             IconButton(systemName: "macwindow.on.rectangle", help: "Abrir no Scratchpad") { model.openScratchpad(model.notes[i].id) }
                             IconButton(systemName: "trash", help: "Apagar nota") { delete(model.notes[i].id) }
                         }
-                        TextEditor(text: Binding(
-                            get: { model.notes[i].body },
-                            set: { model.notes[i].body = $0; model.notes[i].updated = Date() }))
-                            .font(DS.ui(16))
-                            .scrollContentBackground(.hidden)
-                            .lineSpacing(4)
+                        let id = model.notes[i].id
+                        MarkdownEditor(text: model.notes[i].body, size: 16, opensAtTop: true,
+                                       onEdit: { text in model.updateNote(id) { $0.body = text; $0.updated = Date() } })
+                            .id(id)
                         Text("Clique no texto e segure fn para ditar direto na nota. Para anotar sem sair do app em uso, abra o Scratchpad com \(GlobalShortcut.label).")
                             .font(DS.ui(13)).foregroundColor(DS.foregroundTertiary)
                     }
@@ -916,7 +914,8 @@ private struct NoteRow: View {
         .onHover { hover = $0 }
     }
     private var preview: String {
-        let rest = note.body.split(separator: "\n", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
+        let rest = (note.body.split(separator: "\n", maxSplits: 1).dropFirst().first.map(String.init) ?? "")
+            .split(separator: "\n").map { MarkdownStyler.plain(String($0)) }.filter { !$0.isEmpty }.joined(separator: "\n")
         return rest.isEmpty ? note.updated.formatted(date: .abbreviated, time: .omitted) : rest
     }
 }
