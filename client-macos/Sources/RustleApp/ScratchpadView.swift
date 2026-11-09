@@ -329,8 +329,7 @@ private struct NoteListItem: View {
     }
 
     private var snippet: String {
-        note.body.split(separator: "\n", omittingEmptySubsequences: true).dropFirst().first.map(String.init)?
-            .trimmingCharacters(in: .whitespaces) ?? ""
+        note.body.split(separator: "\n", omittingEmptySubsequences: true).dropFirst().first.map { MarkdownStyler.plain(String($0)) } ?? ""
     }
 }
 
@@ -678,21 +677,56 @@ private struct FormattingBar: View {
 
 // MARK: - Editor
 
-/// NSTextView with Wispr's editor metrics and light Markdown styling (headings, bold, italic,
-/// code, quotes, done checklist items), so the note stays plain text that pastes anywhere.
-struct ScratchEditor: NSViewRepresentable {
+/// The Scratchpad's editor: a MarkdownEditor wired to the controller (dictation, formatting, versions).
+struct ScratchEditor: View {
     let controller: ScratchpadController
     let noteID: UUID
     let text: String
 
-    func makeCoordinator() -> Coordinator { Coordinator(controller: controller, noteID: noteID) }
+    var body: some View {
+        MarkdownEditor(text: text,
+                       onAttach: { controller.register($0, for: noteID) },
+                       onEdit: { controller.textChanged($0, note: noteID) })
+    }
+}
+
+/// NSTextView with Wispr's editor metrics that renders a note's Markdown in place: headings,
+/// bold, italic, code, strikethrough, links, bullets, checkboxes, quotes and rules. The note stays
+/// plain Markdown (what is saved, copied, sent and transformed); only attributes and drawing change.
+/// The caret's line shows its syntax, so it can be edited as typed. Used by the Scratchpad and the
+/// hub's Notes page.
+struct MarkdownEditor: NSViewRepresentable {
+    let text: String
+    /// Body text size; every Markdown style scales with it (Scratchpad 14, hub 16).
+    var size: CGFloat = 14
+    /// Open with the caret (and so the scroll) at the top, as the hub does; otherwise the caret
+    /// starts at the end, where Scratchpad dictation lands.
+    var opensAtTop = false
+    var onAttach: @MainActor (NSTextView) -> Void = { _ in }
+    let onEdit: @MainActor (String) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSTextView.scrollableTextView()
+        // TextKit 1, assembled by hand: MarkdownLayoutManager draws the bullets, boxes and rules.
+        let scroll = NSScrollView(frame: NSRect(origin: .zero, size: ScratchpadController.defaultSize))
+        let storage = NSTextStorage()
+        let layout = MarkdownLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: NSSize(width: scroll.contentSize.width, height: .greatestFiniteMagnitude))
+        container.widthTracksTextView = true
+        layout.addTextContainer(container)
+        let view = MarkdownTextView(frame: NSRect(origin: .zero, size: scroll.contentSize), textContainer: container)
+        view.minSize = NSSize(width: 0, height: scroll.contentSize.height)
+        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        view.isVerticallyResizable = true
+        view.isHorizontallyResizable = false
+        view.autoresizingMask = [.width]
+        scroll.documentView = view
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
-        let view = scroll.documentView as! NSTextView
+        view.scale = size / 14
         view.delegate = context.coordinator
         view.drawsBackground = false
         view.isRichText = false
@@ -702,16 +736,19 @@ struct ScratchEditor: NSViewRepresentable {
         view.isContinuousSpellCheckingEnabled = true
         view.textContainerInset = NSSize(width: 11, height: 10)
         view.insertionPointColor = NSColor(DS.glow300)
-        view.typingAttributes = MarkdownStyler.base
+        view.linkTextAttributes = [.foregroundColor: MarkdownStyler.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue,
+                                   .cursor: NSCursor.pointingHand]
         view.string = text
+        if opensAtTop { view.setSelectedRange(NSRange(location: 0, length: 0)) }
         MarkdownStyler.style(view)
-        controller.register(view, for: noteID)
+        onAttach(view)
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let view = scroll.documentView as? NSTextView else { return }
-        controller.register(view, for: noteID)
+        context.coordinator.parent = self
+        onAttach(view)
         if view.string != text, !context.coordinator.isEditing {
             view.string = text
             MarkdownStyler.style(view)
@@ -719,21 +756,24 @@ struct ScratchEditor: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
-        let controller: ScratchpadController
-        let noteID: UUID
+        var parent: MarkdownEditor
         var isEditing = false
-        init(controller: ScratchpadController, noteID: UUID) {
-            self.controller = controller
-            self.noteID = noteID
-        }
+        init(_ parent: MarkdownEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
             isEditing = true
             MarkdownStyler.style(view)
             let text = view.string
-            MainActor.assumeIsolated { controller.textChanged(text, note: noteID) }
+            MainActor.assumeIsolated { parent.onEdit(text) }
             isEditing = false
+        }
+
+        /// Moving to another line hides the old line's syntax and shows the new one's. Deferred,
+        /// because the selection also moves in the middle of an edit.
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let view = notification.object as? MarkdownTextView else { return }
+            DispatchQueue.main.async { view.restyleIfCaretLineChanged() }
         }
 
         /// Enter on a list line continues the list; Enter on an empty item ends it.
@@ -759,65 +799,359 @@ struct ScratchEditor: NSViewRepresentable {
     }
 }
 
+/// The editor's text view: tracks which lines show their syntax, and toggles checkboxes on click.
+final class MarkdownTextView: NSTextView {
+    /// Body size / 14: MarkdownStyler and MarkdownLayoutManager scale their metrics by it.
+    var scale: CGFloat = 1
+    /// Lines whose Markdown syntax is visible (the caret's), nil while the editor is not focused.
+    var revealed: NSRange?
+    private(set) var isFocused = false
+
+    /// The lines the selection touches, when the editor has the focus.
+    var caretLines: NSRange? {
+        isFocused ? (string as NSString).lineRange(for: selectedRange()) : nil
+    }
+
+    func restyleIfCaretLineChanged() {
+        if caretLines != revealed { MarkdownStyler.style(self) }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else { return false }
+        isFocused = true
+        MarkdownStyler.style(self)
+        return true
+    }
+
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        isFocused = false
+        MarkdownStyler.style(self)
+        return true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let box = checkbox(at: convert(event.locationInWindow, from: nil)) else { return super.mouseDown(with: event) }
+        // "- [ ] " -> "- [x] " and back, as an ordinary undoable edit.
+        let marker = (string as NSString).substring(with: box) as NSString
+        let state = NSRange(location: box.location + marker.range(of: "[").location + 1, length: 1)
+        let checked = (string as NSString).substring(with: state) != " "
+        if shouldChangeText(in: state, replacementString: checked ? " " : "x") {
+            replaceCharacters(in: state, with: checked ? " " : "x")
+            didChangeText()
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        if checkbox(at: convert(event.locationInWindow, from: nil)) != nil { NSCursor.pointingHand.set() }
+    }
+
+    /// The task marker ("- [ ]") whose checkbox is under `point`, if any.
+    private func checkbox(at point: NSPoint) -> NSRange? {
+        guard let layout = layoutManager as? MarkdownLayoutManager, let container = textContainer,
+              let storage = textStorage, storage.length > 0 else { return nil }
+        let p = NSPoint(x: point.x - textContainerOrigin.x, y: point.y - textContainerOrigin.y)
+        let char = min(layout.characterIndexForGlyph(at: layout.glyphIndex(for: p, in: container)), storage.length - 1)
+        var hit: NSRange?
+        storage.enumerateAttribute(.markdownMark, in: (string as NSString).paragraphRange(for: NSRange(location: char, length: 0))) { value, range, stop in
+            guard let mark = value as? String, mark == MarkdownStyler.Mark.task || mark == MarkdownStyler.Mark.done,
+                  layout.checkboxRect(for: range).insetBy(dx: -3, dy: -3).contains(p) else { return }
+            hit = range
+            stop.pointee = true
+        }
+        return hit
+    }
+}
+
+/// Draws what the hidden Markdown markers stand for: bullets, checkboxes, quote bars and rules.
+final class MarkdownLayoutManager: NSLayoutManager {
+    private var k: CGFloat { (firstTextView as? MarkdownTextView)?.scale ?? 1 }
+
+    /// Where a marker starts and the line it is on, in container coordinates.
+    private func place(_ chars: NSRange) -> (x: CGFloat, line: NSRect)? {
+        let glyphs = glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
+        guard glyphs.length > 0 else { return nil }
+        let line = lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+        return (line.minX + location(forGlyphAt: glyphs.location).x, line)
+    }
+
+    /// Text sits above the fragment's centre (MarkdownStyler's baseline offset).
+    private func textMidY(_ line: NSRect) -> CGFloat { line.midY - 0.5 * k }
+
+    /// The checkbox drawn for a task marker, in container coordinates (also its click target).
+    func checkboxRect(for chars: NSRange) -> NSRect {
+        guard let (x, line) = place(chars) else { return .zero }
+        return NSRect(x: x + k, y: textMidY(line) - 7 * k, width: 14 * k, height: 14 * k)
+    }
+
+    override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
+        guard let storage = textStorage, let container = textContainers.first else { return }
+        let k = self.k
+        let chars = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
+        storage.enumerateAttribute(.markdownMark, in: chars) { value, range, _ in
+            guard let mark = value as? String, let (x0, line0) = place(range) else { return }
+            let x = x0 + origin.x
+            let line = line0.offsetBy(dx: origin.x, dy: origin.y)
+            let midY = textMidY(line)
+            switch mark {
+            case MarkdownStyler.Mark.bullet:
+                NSColor(DS.foreground).setFill()
+                NSBezierPath(ovalIn: NSRect(x: x + 3 * k, y: midY - 2.5 * k, width: 5 * k, height: 5 * k)).fill()
+            case MarkdownStyler.Mark.task, MarkdownStyler.Mark.done:
+                let box = checkboxRect(for: range).offsetBy(dx: origin.x, dy: origin.y)
+                if mark == MarkdownStyler.Mark.done {
+                    NSColor(DS.foreground).setFill()
+                    NSBezierPath(roundedRect: box, xRadius: 3.5 * k, yRadius: 3.5 * k).fill()
+                    let tick = NSBezierPath()
+                    tick.move(to: NSPoint(x: box.minX + 3.5 * k, y: box.midY))
+                    tick.line(to: NSPoint(x: box.minX + 6 * k, y: box.maxY - 3.5 * k))
+                    tick.line(to: NSPoint(x: box.maxX - 3 * k, y: box.minY + 3.5 * k))
+                    tick.lineWidth = 1.8 * k
+                    tick.lineCapStyle = .round
+                    tick.lineJoinStyle = .round
+                    NSColor(DS.background).setStroke()
+                    tick.stroke()
+                } else {
+                    let path = NSBezierPath(roundedRect: box.insetBy(dx: 0.75 * k, dy: 0.75 * k), xRadius: 3 * k, yRadius: 3 * k)
+                    path.lineWidth = 1.5 * k
+                    NSColor(DS.vast500).setStroke()
+                    path.stroke()
+                }
+            case MarkdownStyler.Mark.quote:
+                NSColor(DS.sand700).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: line.minY + 2 * k, width: 3 * k, height: line.height - 4 * k),
+                             xRadius: 1.5 * k, yRadius: 1.5 * k).fill()
+            case MarkdownStyler.Mark.rule:
+                NSColor(DS.sand700).setFill()
+                NSRect(x: line.minX + container.lineFragmentPadding, y: midY, width: line.width - 2 * container.lineFragmentPadding,
+                       height: 1).fill()
+            default: break
+            }
+        }
+    }
+}
+
+extension NSAttributedString.Key {
+    /// What MarkdownLayoutManager draws over a hidden marker (MarkdownStyler.Mark).
+    static let markdownMark = NSAttributedString.Key("RustleMarkdownMark")
+}
+
 enum MarkdownStyler {
+    enum Mark {
+        static let bullet = "bullet", task = "task", done = "done", quote = "quote", rule = "rule"
+    }
+
     /// NSFontManager weights: 5 regular, 6 medium, 9 bold (a descriptor weight trait is ignored
     /// for a font picked by name, so Figtree's faces are selected this way).
     static func font(_ size: CGFloat, _ weight: Int) -> NSFont {
         NSFontManager.shared.font(withFamily: "Figtree", traits: [], weight: weight, size: size)
             ?? .systemFont(ofSize: size, weight: weight >= 9 ? .bold : (weight >= 6 ? .medium : .regular))
     }
-    static let bodyFont = font(14, 6)
+    /// Hidden syntax keeps its characters but takes no room.
+    static let hiddenFont = NSFont.systemFont(ofSize: 0.1)
+    static let linkColor = NSColor(DS.chord600)
+    static let muted = NSColor(DS.vast500)
 
-    static let paragraph: NSParagraphStyle = {
-        let p = NSMutableParagraphStyle()
-        p.minimumLineHeight = 24
-        p.maximumLineHeight = 24
-        return p
-    }()
+    /// Heading levels 1-6 at a 14pt body: size, line height, baseline offset.
+    private static let headings: [(size: CGFloat, line: CGFloat, baseline: CGFloat)] =
+        [(22, 34, 6), (18, 30, 5), (16, 26, 4), (14, 24, 3), (14, 24, 3), (14, 24, 3)]
 
-    static var base: [NSAttributedString.Key: Any] {
-        [.font: bodyFont, .foregroundColor: NSColor(DS.foreground), .paragraphStyle: paragraph, .baselineOffset: 3]
+    /// Fonts and line metrics for one editor, scaled from the 14pt Scratchpad sizes by `k`.
+    private struct Metrics {
+        let k: CGFloat
+        let body: NSFont, bold: NSFont, code: NSFont
+        let base: [NSAttributedString.Key: Any]
+
+        init(_ k: CGFloat) {
+            self.k = k
+            body = font(14 * k, 6)
+            bold = font(14 * k, 9)
+            code = .monospacedSystemFont(ofSize: 12.5 * k, weight: .regular)
+            base = [.font: body, .foregroundColor: NSColor(DS.foreground), .paragraphStyle: lineStyle(24 * k), .baselineOffset: 3 * k]
+        }
     }
 
-    private static let rules: [(NSRegularExpression, (NSTextStorage, NSTextCheckingResult) -> Void)] = {
-        func re(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p, options: [.anchorsMatchLines]) }
-        let muted = NSColor(DS.vast500)
-        return [
-            (re(#"^#{1,3} .*$"#), { s, m in
-                s.addAttribute(.font, value: font(18, 9), range: m.range)
-                let hp = NSMutableParagraphStyle(); hp.minimumLineHeight = 30; hp.maximumLineHeight = 30
-                s.addAttribute(.paragraphStyle, value: hp, range: m.range)
-                s.addAttribute(.baselineOffset, value: 5, range: m.range)
-            }),
-            (re(#"\*\*[^*\n]+\*\*"#), { s, m in s.addAttribute(.font, value: font(14, 9), range: m.range) }),
-            (re(#"(?<![\w*])_[^_\n]+_(?!\w)"#), { s, m in
-                // The bundled Figtree has no italic face; slant it instead.
-                s.addAttribute(.obliqueness, value: 0.18, range: m.range)
-            }),
-            (re(#"`[^`\n]+`"#), { s, m in
-                s.addAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular), range: m.range)
-                s.addAttribute(.backgroundColor, value: NSColor(DS.backgroundTertiary), range: m.range)
-            }),
-            (re(#"^> .*$"#), { s, m in s.addAttribute(.foregroundColor, value: NSColor(DS.vast600), range: m.range) }),
-            (re(#"^- \[x\] .*$"#), { s, m in
-                s.addAttribute(.foregroundColor, value: muted, range: m.range)
-                s.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: m.range)
-            }),
-            (re(#"^(- \[[ x]\]|-|\d+\.|>|#{1,3}) "#), { s, m in
-                s.addAttribute(.foregroundColor, value: muted, range: m.range)
-            }),
-        ]
-    }()
+    private static func lineStyle(_ height: CGFloat, indent: CGFloat = 0, spaceBefore: CGFloat = 0) -> NSParagraphStyle {
+        let p = NSMutableParagraphStyle()
+        p.minimumLineHeight = height
+        p.maximumLineHeight = height
+        p.headIndent = indent
+        p.paragraphSpacingBefore = spaceBefore
+        return p
+    }
+
+    private static func re(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p) }
+    private static let headingRE = re(#"^(#{1,6})[ \t]+"#)
+    private static let ruleRE = re(#"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$"#)
+    private static let taskRE = re(#"^([ \t]*)([-*+] \[([ xX])\])[ \t]"#)
+    private static let bulletRE = re(#"^([ \t]*)([-*+])[ \t]"#)
+    private static let numberedRE = re(#"^([ \t]*)(\d{1,9}[.)])[ \t]"#)
+    private static let quoteRE = re(#"^ {0,3}(>[ \t]?)"#)
+    private static let fenceRE = re(#"^ {0,3}(```|~~~)"#)
+    private static let codeRE = re(#"`[^`\n]+`"#)
+    private static let boldRE = re(#"\*\*(?=\S).+?(?<=\S)\*\*|(?<!\w)__(?=\S).+?(?<=\S)__(?!\w)"#)
+    private static let italicRE = re(#"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])|(?<![\w_])_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?![\w_])"#)
+    private static let strikeRE = re(#"~~(?=\S)(.+?)(?<=\S)~~"#)
+    private static let linkRE = re(#"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
+    private static let urlRE = re(#"(?<![(\[<\w])https?://[^\s<>]*[^\s<>.,;:!?)\]'"]"#)
 
     static func style(_ view: NSTextView) {
-        guard let storage = view.textStorage else { return }
+        guard let storage = view.textStorage, !view.hasMarkedText() else { return }
+        let md = view as? MarkdownTextView
+        let m = Metrics(md?.scale ?? 1)
+        let reveal = md?.caretLines
+        let ns = storage.string as NSString
         let full = NSRange(location: 0, length: storage.length)
         storage.beginEditing()
-        storage.setAttributes(base, range: full)
-        for (regex, apply) in rules {
-            regex.enumerateMatches(in: storage.string, range: full) { m, _, _ in if let m { apply(storage, m) } }
+        storage.setAttributes(m.base, range: full)
+        var inFence = false
+        ns.enumerateSubstrings(in: full, options: [.byParagraphs, .substringNotRequired]) { _, line, enclosing, _ in
+            let revealed = reveal.map { NSIntersectionRange($0, enclosing).length > 0 || $0 == enclosing } ?? false
+            styleLine(storage, ns, line, m, revealed: revealed, inFence: &inFence)
         }
         storage.endEditing()
-        view.typingAttributes = base
+        md?.revealed = reveal
+        view.typingAttributes = m.base
+    }
+
+    private static func styleLine(_ s: NSTextStorage, _ ns: NSString, _ line: NSRange, _ m: Metrics, revealed: Bool, inFence: inout Bool) {
+        guard line.length > 0 else { return }
+        let k = m.k
+        let text = ns.substring(with: line)
+        let local = NSRange(location: 0, length: line.length)
+        func doc(_ r: NSRange) -> NSRange { NSRange(location: line.location + r.location, length: r.length) }
+        func first(_ regex: NSRegularExpression) -> NSTextCheckingResult? { regex.firstMatch(in: text, range: local) }
+        /// Markers the caret is not on take no room; on the caret's line they show, muted.
+        func syntax(_ r: NSRange) {
+            if revealed {
+                s.addAttribute(.foregroundColor, value: muted, range: r)
+            } else {
+                s.addAttributes([.font: hiddenFont, .foregroundColor: NSColor.clear], range: r)
+            }
+        }
+        /// A marker drawn as something else: its characters take no room and `width` is left for
+        /// the drawing, so "[ ]" and "[x]" (or "-" and "*") line their text up the same way.
+        func drawn(_ r: NSRange, _ mark: String, width: CGFloat) {
+            s.addAttributes([.font: hiddenFont, .foregroundColor: NSColor.clear, .markdownMark: mark], range: r)
+            s.addAttribute(.kern, value: width, range: NSRange(location: NSMaxRange(r) - 1, length: 1))
+        }
+        func width(_ r: NSRange) -> CGFloat { (ns.substring(with: doc(r)) as NSString).size(withAttributes: m.base).width }
+        /// Wrapped lines of a list item or quote start under its text.
+        func hang(_ match: NSTextCheckingResult, marker: Int, width w: CGFloat) {
+            let lead = width(NSRange(location: 0, length: match.range(at: marker).location))
+            let gap = NSRange(location: NSMaxRange(match.range(at: marker)), length: NSMaxRange(match.range) - NSMaxRange(match.range(at: marker)))
+            s.addAttribute(.paragraphStyle, value: lineStyle(24 * k, indent: lead + w + width(gap)), range: line)
+        }
+
+        if first(fenceRE) != nil {
+            inFence.toggle()
+            s.addAttributes([.font: m.code, .foregroundColor: muted], range: line)
+            return
+        }
+        if inFence {
+            s.addAttributes([.font: m.code, .backgroundColor: NSColor(DS.backgroundTertiary)], range: line)
+            return
+        }
+
+        var content = local
+        var heading: Int?
+        if let match = first(headingRE) {
+            let level = match.range(at: 1).length
+            let h = headings[level - 1]
+            heading = level
+            s.addAttributes([.font: font(h.size * k, 9), .baselineOffset: h.baseline * k,
+                             .paragraphStyle: lineStyle(h.line * k, spaceBefore: line.location > 0 ? 6 * k : 0)], range: line)
+            syntax(doc(match.range))
+            content = NSRange(location: match.range.length, length: line.length - match.range.length)
+        } else if first(ruleRE) != nil {
+            s.addAttributes(revealed ? [.foregroundColor: muted] : [.foregroundColor: NSColor.clear, .markdownMark: Mark.rule], range: line)
+            return
+        } else if let match = first(taskRE) {
+            let checked = (text as NSString).substring(with: match.range(at: 3)) != " "
+            drawn(doc(match.range(at: 2)), checked ? Mark.done : Mark.task, width: 22 * k)
+            hang(match, marker: 2, width: 22 * k)
+            content = NSRange(location: match.range.length, length: line.length - match.range.length)
+            if checked {
+                s.addAttributes([.foregroundColor: muted, .strikethroughStyle: NSUnderlineStyle.single.rawValue], range: doc(content))
+            }
+        } else if let match = first(bulletRE) {
+            drawn(doc(match.range(at: 2)), Mark.bullet, width: 12 * k)
+            hang(match, marker: 2, width: 12 * k)
+            content = NSRange(location: match.range.length, length: line.length - match.range.length)
+        } else if let match = first(numberedRE) {
+            s.addAttribute(.foregroundColor, value: muted, range: doc(match.range(at: 2)))
+            hang(match, marker: 2, width: width(match.range(at: 2)))
+            content = NSRange(location: match.range.length, length: line.length - match.range.length)
+        } else if let match = first(quoteRE) {
+            s.addAttribute(.foregroundColor, value: NSColor(DS.vast600), range: line)
+            drawn(doc(match.range(at: 1)), Mark.quote, width: 14 * k)
+            hang(match, marker: 1, width: 14 * k)
+            content = NSRange(location: match.range.length, length: line.length - match.range.length)
+        }
+
+        // Inline spans; nothing is styled inside `code`.
+        var code: [NSRange] = []
+        codeRE.enumerateMatches(in: text, range: content) { match, _, _ in
+            guard let r = match?.range else { return }
+            code.append(r)
+            s.addAttributes([.font: m.code, .backgroundColor: NSColor(DS.backgroundTertiary)], range: doc(r))
+            syntax(doc(NSRange(location: r.location, length: 1)))
+            syntax(doc(NSRange(location: NSMaxRange(r) - 1, length: 1)))
+        }
+        func spans(_ regex: NSRegularExpression, _ body: (NSTextCheckingResult) -> Void) {
+            regex.enumerateMatches(in: text, range: content) { match, _, _ in
+                guard let match, !code.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else { return }
+                body(match)
+            }
+        }
+        spans(boldRE) { match in
+            if heading == nil { s.addAttribute(.font, value: m.bold, range: doc(match.range)) }
+            syntax(doc(NSRange(location: match.range.location, length: 2)))
+            syntax(doc(NSRange(location: NSMaxRange(match.range) - 2, length: 2)))
+        }
+        spans(italicRE) { match in
+            // The bundled Figtree has no italic face; slant it instead.
+            s.addAttribute(.obliqueness, value: 0.18, range: doc(match.range))
+            syntax(doc(NSRange(location: match.range.location, length: 1)))
+            syntax(doc(NSRange(location: NSMaxRange(match.range) - 1, length: 1)))
+        }
+        spans(strikeRE) { match in
+            s.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: doc(match.range(at: 1)))
+            syntax(doc(NSRange(location: match.range.location, length: 2)))
+            syntax(doc(NSRange(location: NSMaxRange(match.range) - 2, length: 2)))
+        }
+        spans(linkRE) { match in
+            let label = match.range(at: 1)
+            if let url = URL(string: (text as NSString).substring(with: match.range(at: 2))) {
+                s.addAttribute(.link, value: url, range: doc(label))
+            }
+            syntax(doc(NSRange(location: match.range.location, length: 1)))
+            syntax(doc(NSRange(location: NSMaxRange(label), length: NSMaxRange(match.range) - NSMaxRange(label))))
+        }
+        spans(urlRE) { match in
+            if let url = URL(string: (text as NSString).substring(with: match.range)) { s.addAttribute(.link, value: url, range: doc(match.range)) }
+        }
+    }
+
+    /// A line as plain text for list previews: block marker and inline syntax removed.
+    static func plain(_ line: String) -> String {
+        var s = line.replacingOccurrences(of: #"^\s*(#{1,6}|[-*+] \[[ xX]\]|[-*+]|\d{1,9}[.)]|>)\s+"#, with: "", options: .regularExpression)
+        s = linkRE.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: (s as NSString).length), withTemplate: "$1")
+        for re in [boldRE, strikeRE, codeRE, italicRE] {
+            let ns = s as NSString
+            var out = ""
+            var last = 0
+            re.enumerateMatches(in: s, range: NSRange(location: 0, length: ns.length)) { match, _, _ in
+                guard let r = match?.range else { return }
+                let marker = re === boldRE || re === strikeRE ? 2 : 1
+                out += ns.substring(with: NSRange(location: last, length: r.location - last))
+                out += ns.substring(with: NSRange(location: r.location + marker, length: r.length - 2 * marker))
+                last = NSMaxRange(r)
+            }
+            s = out + ns.substring(from: last)
+        }
+        return s.trimmingCharacters(in: .whitespaces)
     }
 }
